@@ -1,0 +1,154 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class SqueezeExcitation1D(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1)
+        return x * y
+
+
+class SqueezeExcitation2D(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+
+class ConvBlock2D(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super().__init__()
+        self.bn = nn.BatchNorm2d(in_channels)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=False)
+        self.se = SqueezeExcitation2D(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.conv(x)
+        x = self.se(x)
+        x = self.relu(x)
+        return x
+
+
+class ConvBlock1D(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super().__init__()
+        self.bn = nn.BatchNorm1d(in_channels)
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=False)
+        self.se = SqueezeExcitation1D(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.conv(x)
+        x = self.se(x)
+        x = self.relu(x)
+        return x
+
+
+class ECGNet(nn.Module):
+    def __init__(self, input_channels=12, num_classes=9):
+        super(ECGNet, self).__init__()
+        self.init_conv = ConvBlock2D(1, 32, kernel_size=(1, 25), stride=(1, 2), padding=(0, 12))
+        self.mid_conv = ConvBlock2D(32, 32, kernel_size=(1, 15), stride=(1, 8), padding=(0, 7))  # Adjust stride to reduce ~2048->127 approx
+
+        # Multi-scale 2D branches
+        self.conv2d_3 = ConvBlock2D(32, 32, kernel_size=(1, 5), stride=1, padding=(0, 1))
+        self.conv2d_5 = ConvBlock2D(32, 32, kernel_size=(1, 7), stride=1, padding=(0, 2))
+        self.conv2d_7 = ConvBlock2D(32, 32, kernel_size=(1, 9), stride=1, padding=(0, 3))
+
+        # Multi-scale 1D branches (in_channels = 32 * input_channels)
+        feat_channels = 32 * input_channels
+        self.conv1d_3 = ConvBlock1D(feat_channels, feat_channels, kernel_size=5, stride=1, padding=1)
+        self.conv1d_5 = ConvBlock1D(feat_channels, feat_channels, kernel_size=7, stride=1, padding=2)
+        self.conv1d_7 = ConvBlock1D(feat_channels, feat_channels, kernel_size=9, stride=1, padding=3)
+
+        # Classifier
+        self.fc = nn.Linear(3 * feat_channels, num_classes)
+
+    def forward(self, x):
+        # x: (B, input_channels=leads, seq_len)
+        x = x.unsqueeze(1)  # (B, 1, leads, seq_len)
+
+        # Initial 2D conv
+        x = self.init_conv(x)
+
+        # Mid 2D conv
+        x = self.mid_conv(x)
+
+        # Parallel 2D multi-scale
+        out3_2d = self.conv2d_3(x)
+        out5_2d = self.conv2d_5(x)
+        out7_2d = self.conv2d_7(x)
+
+        # Reshape to 1D: (B, 32, leads, t) -> (B, 32*leads, t)
+        def reshape_to_1d(feat):
+            b, c, h, w = feat.size()
+            return feat.view(b, c * h, w)  # (B, 32*leads, t)
+
+        out3_1d = reshape_to_1d(out3_2d)
+        out5_1d = reshape_to_1d(out5_2d)
+        out7_1d = reshape_to_1d(out7_2d)
+
+        # Parallel 1D multi-scale
+        out3 = self.conv1d_3(out3_1d)
+        out5 = self.conv1d_5(out5_1d)
+        out7 = self.conv1d_7(out7_1d)
+
+        # Global Avg Pool to (B, feat_channels)
+        out3 = F.adaptive_avg_pool1d(out3, 1).squeeze(-1)
+        out5 = F.adaptive_avg_pool1d(out5, 1).squeeze(-1)
+        out7 = F.adaptive_avg_pool1d(out7, 1).squeeze(-1)
+
+        # Concat
+        x = torch.cat((out3, out5, out7), dim=1)
+
+        # FC
+        logits = self.fc(x)
+
+        # Dummy attention
+        dummy_attention = torch.ones(x.size(0), 1).to(x.device)
+        return logits, dummy_attention
+
+
+def ecgnet(**kwargs):
+    model = ECGNet(**kwargs)
+    return model
+
+
+# Example usage
+if __name__ == "__main__":
+    model = ecgnet(input_channels=12, num_classes=9)
+    print(model)
+
+    x = torch.randn(4, 12, 5000)  # batch=4, 12 leads, seq_len=5000
+    logits, attn = model(x)
+    print("logits shape:", logits.shape)  # torch.Size([4, 9])
+    print("attention shape:", attn.shape)  # torch.Size([4, 1])
