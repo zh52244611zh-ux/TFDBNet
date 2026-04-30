@@ -1,0 +1,60 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class LSTMECG(nn.Module):
+    def __init__(self, input_size=12, hidden_size=64, num_classes=2, num_layers=4, bidirectional=True, dropout=0.2):
+        super(LSTMECG, self).__init__()
+        self.bidirectional = bidirectional
+        self.num_directions = 2 if bidirectional else 1
+        self.dense1 = nn.Linear(input_size, 32)
+        self.lstm = nn.LSTM(32, hidden_size, num_layers=num_layers, bidirectional=bidirectional, batch_first=True, dropout=dropout if num_layers > 1 else 0.0)
+        self.dropout1 = nn.Dropout(dropout)
+        self.bn1 = nn.BatchNorm1d(hidden_size * self.num_directions)  # Bidirectional adjustment
+        self.dense2 = nn.Linear(hidden_size * self.num_directions, 64)
+        self.dropout2 = nn.Dropout(dropout)
+        self.bn2 = nn.BatchNorm1d(64)
+        self.fc = nn.Linear(64, num_classes)
+
+    def forward(self, x):
+        # x: (batch, channels, seq_len)
+        x = x.permute(0, 2, 1)  # -> (batch, seq_len, input_size)
+        x = F.relu(self.dense1(x))
+
+        x, _ = self.lstm(x)  # -> (batch, seq_len, hidden_size * num_directions)
+
+        # --- 改进：使用池化代替仅取最后一步 ---
+        # x 形状为 (batch, seq_len, hidden_features)
+        # 将 seq_len 维度转到末尾以进行池化
+        x = x.transpose(1, 2)
+        p1 = F.adaptive_avg_pool1d(x, 1)
+        p2 = F.adaptive_max_pool1d(x, 1)
+        x = torch.cat((p1, p2), dim=1).squeeze(-1)  # 拼接均值和最大值特征
+
+        # --- 规范的线性层顺序 ---
+        x = self.dense2(x)
+        x = self.bn2(x)
+        x = F.relu(x)
+        x = self.dropout2(x)
+
+        logits = self.fc(x)
+
+        # 返回结果
+        dummy_attention = torch.ones(x.size(0), 1).to(x.device)
+        return logits, dummy_attention
+
+# Compatibility with original ResNet calling (input_channels instead of input_size)
+def lstm_ecg(input_channels=12, num_classes=2, num_layers=4, bidirectional=True, dropout=0.2, **kwargs):
+    return LSTMECG(input_size=input_channels, num_classes=num_classes, num_layers=num_layers, bidirectional=bidirectional, dropout=dropout)
+
+
+# Example usage (similar to resnet18)
+if __name__ == "__main__":
+    model = lstm_ecg(input_channels=12, num_classes=2, num_layers=2)
+    print(model)
+
+    x = torch.randn(4, 12, 5000)  # batch=4, 12 leads, seq_len=5000
+    logits, attn = model(x)
+    print("logits shape:", logits.shape)  # torch.Size([4, 9])
+    print("attention shape:", attn.shape)  # torch.Size([4, 1])
