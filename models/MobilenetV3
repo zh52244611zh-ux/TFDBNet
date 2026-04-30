@@ -1,0 +1,167 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class hswish(nn.Module):
+    def forward(self, x):
+        out = x * F.relu6(x + 3, inplace=True) / 6
+        return out
+
+
+class hsigmoid(nn.Module):
+    def forward(self, x):
+        out = F.relu6(x + 3, inplace=True) / 6
+        return out
+
+
+class SE1d(nn.Module):
+    def __init__(self, inp, oup, reduction=4):
+        super(SE1d, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(oup, inp // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(inp // reduction, oup, bias=False),
+            hsigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1)
+        return x * y.expand_as(x)
+
+
+class InvertedResidual1d(nn.Module):
+    def __init__(self, inp, hidden_dim, oup, kernel_size, stride, use_se, use_hs):
+        super(InvertedResidual1d, self).__init__()
+        self.identity = stride == 1 and inp == oup
+        self.use_se = use_se
+
+        if inp == hidden_dim:
+            self.conv = nn.Sequential(
+                # dw
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size, stride, (kernel_size - 1) // 2, groups=hidden_dim,
+                          bias=False),
+                nn.BatchNorm1d(hidden_dim),
+                hswish() if use_hs else nn.ReLU(inplace=True),
+                # Squeeze-and-Excite
+                SE1d(inp, hidden_dim) if use_se else nn.Identity(),
+                # pw-linear
+                nn.Conv1d(hidden_dim, oup, 1, 1, 0, bias=False),
+                nn.BatchNorm1d(oup),
+            )
+        else:
+            self.conv = nn.Sequential(
+                # pw
+                nn.Conv1d(inp, hidden_dim, 1, 1, 0, bias=False),
+                nn.BatchNorm1d(hidden_dim),
+                hswish() if use_hs else nn.ReLU(inplace=True),
+                # dw
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size, stride, (kernel_size - 1) // 2, groups=hidden_dim,
+                          bias=False),
+                nn.BatchNorm1d(hidden_dim),
+                # Squeeze-and-Excite
+                SE1d(inp, hidden_dim) if use_se else nn.Identity(),
+                hswish() if use_hs else nn.ReLU(inplace=True),
+                # pw-linear
+                nn.Conv1d(hidden_dim, oup, 1, 1, 0, bias=False),
+                nn.BatchNorm1d(oup),
+            )
+
+    def forward(self, x):
+        if self.identity:
+            return x + self.conv(x)
+        else:
+            return self.conv(x)
+
+
+class MobileNetV3(nn.Module):
+    def __init__(self, input_channels=12, num_classes=9, mode='large', width_mult=1.0, dropout=0.3):
+        super(MobileNetV3, self).__init__()
+        # Enhanced configuration for higher complexity: more blocks, wider channels
+        if mode == 'large':
+            # (out_channels, expand_ratio, kernel, stride, se, hs, repeats)
+            cfg = [
+                (16, 1, 3, 1, False, False, 1),
+                (32, 4, 3, 2, False, False, 1),
+                (32, 3, 3, 1, False, False, 1),
+                (48, 3, 5, 2, True, True, 2),
+                (48, 3, 3, 1, True, True, 2),
+                (96, 6, 5, 2, True, True, 3),
+                (96, 6, 3, 1, True, True, 3),
+                (192, 6, 5, 2, True, True, 3),
+                (192, 6, 3, 1, True, True, 3),
+                (384, 6, 3, 1, True, True, 2),  # Added extra blocks for complexity
+            ]
+            last_channels = 1536  # Increased last conv channels
+        else:
+            raise ValueError("Unsupported mode, use 'large' for higher complexity.")
+
+        # Scale channels with width_mult
+        self.cfg = [(int(c * width_mult), er, k, s, se, hs, r) for c, er, k, s, se, hs, r in cfg]
+
+        # First conv
+        self.conv1 = nn.Conv1d(input_channels, self.cfg[0][0], kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm1d(self.cfg[0][0])
+        self.hs1 = hswish()
+
+        # Build layers
+        self.layers = nn.ModuleList()
+        in_channels = self.cfg[0][0]
+        for out_channels, expand_ratio, kernel, stride, se, hs, repeats in self.cfg:
+            for _ in range(repeats):
+                hidden_dim = in_channels * expand_ratio
+                self.layers.append(InvertedResidual1d(in_channels, hidden_dim, out_channels, kernel, stride, se, hs))
+                in_channels = out_channels  # Update for next
+
+        # Last conv
+        self.last_conv = nn.Conv1d(in_channels, last_channels, kernel_size=1, bias=False)
+        self.last_bn = nn.BatchNorm1d(last_channels)
+        self.last_hs = hswish()
+
+        # Global pooling and classifier
+        self.global_avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(last_channels, num_classes)
+
+    def forward(self, x):
+        # x: (batch, input_channels, seq_len)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.hs1(x)
+
+        for layer in self.layers:
+            x = layer(x)
+
+        x = self.last_conv(x)
+        x = self.last_bn(x)
+        x = self.last_hs(x)
+
+        x = self.global_avg_pool(x)  # (batch, last_channels, 1)
+        x = x.view(x.size(0), -1)  # (batch, last_channels)
+        x = self.dropout(x)
+        logits = self.fc(x)
+
+        # Dummy attention as in original ResNet
+        dummy_attention = torch.ones(x.size(0), 1).to(x.device)
+
+        return logits, dummy_attention
+
+
+# Compatibility with original ResNet calling
+def mobilenetv3_large(**kwargs):
+    model = MobileNetV3(mode='large', **kwargs)
+    return model
+
+
+# Example usage (similar to resnet18)
+if __name__ == "__main__":
+    model = mobilenetv3_large(input_channels=12, num_classes=9)
+    print(model)
+
+    x = torch.randn(4, 12, 5000)  # batch=4, 12 leads, seq_len=5000
+    logits, attn = model(x)
+    print("logits shape:", logits.shape)  # torch.Size([4, 9])
+    print("attention shape:", attn.shape)  # torch.Size([4, 1])
