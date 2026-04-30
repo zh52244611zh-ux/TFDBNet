@@ -1,0 +1,141 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class BasicBlock1d(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super().__init__()
+        self.conv1 = nn.Conv1d(inplanes, planes, kernel_size=7, stride=stride, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm1d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(p=0.2)  # 轻微dropout防过拟合
+        self.conv2 = nn.Conv1d(planes, planes, kernel_size=7, stride=1, padding=3, bias=False)
+        self.bn2 = nn.BatchNorm1d(planes)
+        self.downsample = downsample
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+        return out
+
+
+class DualBranchResNet(nn.Module):
+    """
+    纯1D ResNet分支（消融实验用 1D-Only 基线）
+    对应论文中的：1D-Only 或 Time-domain Baseline
+    """
+    def __init__(self,
+                 block=BasicBlock1d,
+                 layers=[2, 2, 2, 2],
+                 input_channels=12,
+                 num_classes=2,
+                 signal_length=15000,
+                 use_dual_pooling=True):   # 可开关双池化
+        super().__init__()
+        self.inplanes = 64
+        self.use_dual_pooling = use_dual_pooling
+
+        # Initial conv
+        self.conv1 = nn.Conv1d(input_channels, 64, kernel_size=15, stride=2, padding=7, bias=False)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+
+        # Residual blocks
+        self.layer1 = self._make_layer(block, 64,  layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+
+        # Global pooling
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+        self.maxpool = nn.AdaptiveMaxPool1d(1)
+
+        # Classifier
+        if use_dual_pooling:
+            self.fc = nn.Linear(512 * block.expansion * 2, num_classes)  # 512×2 = 1024
+        else:
+            self.fc = nn.Linear(512 * block.expansion, num_classes)
+
+        self.dropout = nn.Dropout(0.5)
+
+        # Initialize weights
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv1d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm1d(planes * block.expansion),
+            )
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample))
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        # x: [B, C=12, L=15000]
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)   # [B, 512, L']
+
+        # Global pooling
+        if self.use_dual_pooling:
+            avg_x = self.avgpool(x).flatten(1)
+            max_x = self.maxpool(x).flatten(1)
+            x = torch.cat([avg_x, max_x], dim=1)   # [B, 1024]
+        else:
+            x = self.avgpool(x).flatten(1)        # [B, 512]
+
+        x = self.dropout(x)
+        logits = self.fc(x)
+        return logits, None
+
+
+# ==================== 常用变体快捷函数 ====================
+def resnet18_1d_only(**kwargs):
+    """ResNet18 结构的纯1D版本"""
+    return DualBranchResNet(BasicBlock1d, [2, 2, 2, 2], **kwargs)
+
+
+def resnet34_1d_only(**kwargs):
+    """ResNet34 结构的纯1D版本"""
+    return DualBranchResNet(BasicBlock1d, [3, 4, 6, 3], **kwargs)
+
+
+def resnet50_1d_only(**kwargs):
+    """如果你以后想换成Bottleneck（ResNet50/101）也可以直接支持"""
+    from torchvision.models.resnet import Bottleneck
+    return DualBranchResNet(Bottleneck, [3, 4, 6, 3], **kwargs)
