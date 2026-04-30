@@ -1,0 +1,154 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class BasicBlock2d(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super().__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.downsample = downsample
+
+    def forward(self, x):
+        identity = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out += identity
+        out = self.relu(out)
+        return out
+
+
+class DualBranchResNet(nn.Module):
+    """
+    纯 STFT + ResNet 基线（完全无注意力）
+    推荐用于论文中的：STFT-Only (CNN Baseline)
+    """
+    def __init__(self,
+                 input_channels=12,
+                 n_fft=96,
+                 hop_length=32,
+                 inplanes=64,
+                 num_classes=9,
+                 signal_length=15000,
+                 use_dual_pooling=True):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.signal_length = signal_length
+        self.use_dual_pooling = use_dual_pooling
+
+        # 必须初始化 inplanes
+        self.inplanes = inplanes
+
+        # 初始大核卷积
+        self.stft_conv = nn.Conv2d(input_channels, inplanes, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(inplanes)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        # ResNet 残差块（标准 ResNet18 结构）
+        self.layer1 = self._make_layer(BasicBlock2d, 64,  2)
+        self.layer2 = self._make_layer(BasicBlock2d, 128, 2, stride=2)
+        self.layer3 = self._make_layer(BasicBlock2d, 256, 2, stride=2)
+        self.layer4 = self._make_layer(BasicBlock2d, 512, 2, stride=2)
+
+        # 全局池化
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.maxpool = nn.AdaptiveMaxPool2d(1)
+
+        # 分类头
+        feature_dim = 512 * 2 if use_dual_pooling else 512
+        self.fc = nn.Linear(feature_dim, num_classes)
+        self.dropout = nn.Dropout(0.5)
+
+        # 参数初始化
+        self._initialize_weights()
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample))
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+        return nn.Sequential(*layers)
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        B, C, L = x.shape
+
+        # 1. Pad / truncate to fixed length
+        if L != self.signal_length:
+            if L < self.signal_length:
+                x = F.pad(x, (0, self.signal_length - L))
+            else:
+                x = x[:, :, :self.signal_length]
+
+        # 2. 多导联 STFT 幅度谱（向量化写法，更快）
+        window = torch.hann_window(self.n_fft, device=x.device)
+        x_stft = torch.stft(
+            x.view(-1, L),                     # [B*C, L]
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            window=window,
+            return_complex=True,
+            pad_mode='reflect'
+        )
+        x_mag = torch.abs(x_stft)              # [B*C, F, T]
+        x_mag = x_mag.view(B, C, x_mag.shape[1], x_mag.shape[2])  # [B, C, F, T]
+        x = x_mag
+
+        # 3. Backbone
+        x = self.stft_conv(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)      # [B, 512, h, w]
+
+        # 4. 双池化
+        if self.use_dual_pooling:
+            x = torch.cat([self.avgpool(x), self.maxpool(x)], dim=1)  # [B, 1024, 1, 1]
+        else:
+            x = self.avgpool(x)
+
+        x = x.flatten(1)
+        x = self.dropout(x)
+        logits = self.fc(x)
+        return logits,None
+
+
+# ==================== 推荐快捷函数 ====================
+def stft_resnet18_pure(**kwargs):
+    """最强纯 CNN 频域基线（推荐用于论文表格第一行）"""
+    return DualBranchResNet(use_dual_pooling=True, **kwargs)
+
+def stft_resnet18_pure_singlepool(**kwargs):
+    """轻量版，只用 AvgPool"""
+    return DualBranchResNet(use_dual_pooling=False, **kwargs)
