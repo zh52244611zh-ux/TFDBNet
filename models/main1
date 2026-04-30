@@ -1,0 +1,918 @@
+import argparse
+import os
+import torch
+import torch.nn as nn
+import random
+from torch.utils.data import DataLoader, Subset
+from torch.utils.tensorboard import SummaryWriter
+from sklearn.model_selection import StratifiedKFold, train_test_split, KFold
+from sklearn.metrics import confusion_matrix, precision_recall_fscore_support, f1_score, roc_auc_score, precision_score, \
+    recall_score, roc_curve, auc, precision_recall_curve, average_precision_score
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import json
+import datetime
+from collections import Counter
+import warnings
+import logging
+import torch.nn.functional as F
+
+warnings.filterwarnings('ignore')
+
+from tqdm import tqdm
+# from dataset import ECGDataset  # Assume this is your dataset class
+from dataset_ptb_xl import ECGDataset
+from dual_MDLA_HiLo_MLLA_2 import DualBranchResNet
+from utils import cal_f1s, cal_aucs, split_data  # Assume these exist
+import matplotlib
+
+# --- Global Font and Figure Settings for Word Compatibility ---
+matplotlib.rcParams['font.family'] = 'Times New Roman'
+matplotlib.rcParams['font.size'] = 12
+matplotlib.rcParams['axes.labelsize'] = 12
+matplotlib.rcParams['axes.titlesize'] = 13
+matplotlib.rcParams['xtick.labelsize'] = 11
+matplotlib.rcParams['ytick.labelsize'] = 11
+matplotlib.rcParams['legend.fontsize'] = 10
+matplotlib.rcParams['figure.dpi'] = 300
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    # parser.add_argument('--data-dir', type=str, default='E:\\cpsc2018\\Training_WFDB', help='Directory for data dir')
+    parser.add_argument('--data-dir', type=str, default='E:/ptbxl/records500', help='Directory for data dir')
+    parser.add_argument('--leads', type=str, default='all', help='ECG leads to use')
+    parser.add_argument('--seed', type=int, default=42, help='Seed to split data')
+    parser.add_argument('--num-classes', type=int, default=2, help='Num of diagnostic classes')
+    parser.add_argument('--lr', '--learning-rate', type=float, default=0.0001, help='Learning rate')
+    parser.add_argument('--batch-size', type=int, default=16, help='Batch size')
+    parser.add_argument('--num-workers', type=int, default=4, help='Num of workers to load data')
+    parser.add_argument('--phase', type=str, default='train', help='Phase: train or test')
+    parser.add_argument('--epochs', type=int, default=40, help='Training epochs')
+    parser.add_argument('--resume', default=False, action='store_true', help='Resume')
+    parser.add_argument('--use-gpu', default=True, action='store_true', help='Use GPU')
+    parser.add_argument('--model-path', type=str, default='', help='Path to saved model')
+    parser.add_argument('--k-fold', type=int, default=0, help='Number of folds for cross-validation (0 for single run)')
+    parser.add_argument('--early-stopping', type=int, default=15, help='Early stopping patience')
+    parser.add_argument('--log-dir', type=str, default='E:\\ecg-diagnosis-master\\logs', help='Directory for logs')
+    parser.add_argument('--class-weight', default=True, action='store_true', help='Use class weights')
+    parser.add_argument('--experiment', type=str, default='exp', help='Experiment name')
+    parser.add_argument('--weight-decay', type=float, default=0.0001, help='Weight decay for optimizer')
+    parser.add_argument('--test-size', type=float, default=0.2, help='Test set size for k-fold CV')
+    parser.add_argument('--grad-clip', type=float, default=0.5, help='Gradient clipping max norm')
+    parser.add_argument('--run-description', type=str, default='ecg_gnn', help='Run description for log file')
+    parser.add_argument('--weight-scale', type=float, default=1.0, help='Scaling factor for class weights')
+    # 新增结果目录参数
+    parser.add_argument('--result-dir', type=str,
+                        default='fold_MDLA_HILO_MDLA_-8-w0.0001-0.7-0.0001-dual2_2D-0.4-GAMMA2.0-SCALE1.0_2class',
+                        help='Directory name under E:\\ecg-diagnosis-master\\results for saving visualization results')
+
+    parser.add_argument('--processed-dir', type=str,
+                        default='E:/ecg-diagnosis-master/data/full_signals_2class',
+                        help='预处理后 .npy 文件所在文件夹（必须包含 xxxx_hr_signal.npy）')
+
+    parser.add_argument('--label-csv', type=str,
+                        default=None,
+                        help='labels_2class.csv 的完整路径。如果不指定，会自动在 processed-dir 中查找')
+    parser.add_argument('--signal-length', type=int, default=15000,
+                        help='Target signal length in samples (15000 for 30s, 5000 for 10s)')
+
+    return parser.parse_args()
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+set_seed(42)
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        BCE_loss = nn.BCEWithLogitsLoss(reduction='none')(inputs, targets)
+        pt = torch.exp(-BCE_loss)
+        focal_loss = (1 - pt) ** self.gamma * BCE_loss
+        if self.alpha is not None:
+            if self.alpha.dim() == 1:
+                self.alpha = self.alpha.unsqueeze(0)
+            focal_loss = self.alpha * focal_loss
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
+
+
+class Trainer:
+    def __init__(self, args, device, metrics_log_path, class_names):
+        self.args = args
+        self.device = device
+        self.metrics_log_path = metrics_log_path
+        self.class_names = class_names
+        self.writer = SummaryWriter(log_dir=os.path.join(args.log_dir, 'tensorboard'))
+        self.best_metric = 0
+        self.epochs_no_improve = 0
+        self.train_losses = []
+        self.val_losses = []
+        self.train_f1s = []
+        self.val_f1s = []
+        os.makedirs(os.path.join(args.log_dir, 'models'), exist_ok=True)
+
+        # 创建结果目录
+        self.results_base_dir = 'E:\\ecg-diagnosis-master\\results'
+        self.current_result_dir = os.path.join(self.results_base_dir, args.result_dir)
+        os.makedirs(self.current_result_dir, exist_ok=True)
+
+    def count_parameters(self, net):
+        return sum(p.numel() for p in net.parameters() if p.requires_grad) / 1e6
+
+    def calculate_class_weights(self, dataset):
+        all_labels = []
+        for i in range(len(dataset)):
+            _, label = dataset[i]
+            all_labels.append(label.cpu().numpy())
+        all_labels = np.vstack(all_labels)
+        class_counts = all_labels.sum(axis=0) + 1e-6  # Avoid division by zero
+        total = len(dataset)
+
+        # 记录类别分布信息用于调试
+        with open(self.metrics_log_path, 'a') as f:
+            f.write(f"\n=== Class Distribution ===\n")
+            f.write("Class | Count | Proportion\n")
+            for i, count in enumerate(class_counts):
+                proportion = count / total
+                f.write(f"{i:>5} | {int(count):>5} | {proportion:>10.4f}\n")
+
+        # 方法1: 使用中位数平衡（推荐，更稳定）
+        median_count = np.median(class_counts)
+        weights = median_count / class_counts
+
+        # 应用缩放因子，使用更温和的缩放
+        weights = weights ** self.args.weight_scale
+
+        # 更严格的权重裁剪，避免极端值
+        weights = np.clip(weights, 0.3, 3.0)  # 从[0.3, 10.0]改为[0.3, 3.0]
+
+        # 可选：对权重进行归一化，使其均值为1
+        weights = weights / np.mean(weights)
+
+        # 记录详细的权重信息
+        with open(self.metrics_log_path, 'a') as f:
+            f.write(f"Raw inverse frequencies: {total / class_counts}\n")
+            f.write(f"Final class weights: {weights}\n")
+            f.write(f"Weight range: {np.min(weights):.3f} - {np.max(weights):.3f}\n")
+            f.write(f"Weight ratio (max/min): {np.max(weights) / np.min(weights):.3f}\n")
+            f.write(f"Weight mean: {np.mean(weights):.3f}\n")
+
+        return torch.tensor(weights, dtype=torch.float32).to(self.device)
+
+    def plot_learning_curves(self, fold=0):
+        """绘制训练和验证损失曲线，用于检测过拟合"""
+        if len(self.train_losses) == 0 or len(self.val_losses) == 0:
+            return
+
+        epochs = range(1, len(self.train_losses) + 1)
+
+        # 创建子图
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+
+        # 绘制损失曲线
+        ax1.plot(epochs, self.train_losses, 'b-', label='Training Loss', linewidth=2)
+        ax1.plot(epochs, self.val_losses, 'r-', label='Validation Loss', linewidth=2)
+        ax1.set_title(f'Training and Validation Loss (Fold {fold})')
+        ax1.set_xlabel('Epochs')
+        ax1.set_ylabel('Loss')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+
+        # 标记最佳验证损失点
+        best_val_epoch = np.argmin(self.val_losses)
+        best_val_loss = self.val_losses[best_val_epoch]
+        ax1.plot(best_val_epoch + 1, best_val_loss, 'ro', markersize=8,
+                 label=f'Best Val Loss: {best_val_loss:.4f}')
+        ax1.legend()
+
+        # 绘制F1分数曲线
+        if len(self.train_f1s) > 0 and len(self.val_f1s) > 0:
+            ax2.plot(epochs, self.train_f1s, 'b-', label='Training F1', linewidth=2)
+            ax2.plot(epochs, self.val_f1s, 'r-', label='Validation F1', linewidth=2)
+            ax2.set_title(f'Training and Validation F1 Score (Fold {fold})')
+            ax2.set_xlabel('Epochs')
+            ax2.set_ylabel('F1 Score')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+
+            # 标记最佳验证F1点
+            best_val_f1_epoch = np.argmax(self.val_f1s)
+            best_val_f1 = self.val_f1s[best_val_f1_epoch]
+            ax2.plot(best_val_f1_epoch + 1, best_val_f1, 'ro', markersize=8,
+                     label=f'Best Val F1: {best_val_f1:.4f}')
+            ax2.legend()
+
+        plt.tight_layout()
+
+        # 保存图像
+        curves_path = os.path.join(self.current_result_dir, f'learning_curves.png')
+        plt.savefig(curves_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+        # 分析过拟合情况
+        self._analyze_overfitting(fold)
+
+        return fig
+
+    def _analyze_overfitting(self, fold=0):
+        """分析过拟合情况并记录到日志"""
+        if len(self.train_losses) < 2 or len(self.val_losses) < 2:
+            return
+
+        # 计算训练和验证损失的最终差距
+        final_train_loss = self.train_losses[-1]
+        final_val_loss = self.val_losses[-1]
+        loss_gap = final_val_loss - final_train_loss
+
+        # 计算最佳验证损失后的性能变化
+        best_val_epoch = np.argmin(self.val_losses)
+        if best_val_epoch < len(self.val_losses) - 1:
+            val_loss_after_best = self.val_losses[best_val_epoch + 1:]
+            train_loss_after_best = self.train_losses[best_val_epoch + 1:]
+
+            # 检查验证损失是否开始上升而训练损失继续下降
+            val_increasing = any(val_loss_after_best[i] > val_loss_after_best[i - 1]
+                                 for i in range(1, len(val_loss_after_best)))
+            train_decreasing = any(train_loss_after_best[i] < train_loss_after_best[i - 1]
+                                   for i in range(1, len(train_loss_after_best)))
+
+            overfitting_detected = val_increasing and train_decreasing
+        else:
+            overfitting_detected = False
+
+        # 记录分析结果
+        with open(self.metrics_log_path, 'a') as f:
+            f.write(f"\n=== Overfitting Analysis (Fold {fold}) ===\n")
+            f.write(f"Final Training Loss: {final_train_loss:.4f}\n")
+            f.write(f"Final Validation Loss: {final_val_loss:.4f}\n")
+            f.write(f"Loss Gap (Val - Train): {loss_gap:.4f}\n")
+            f.write(f"Best Validation Loss at Epoch: {best_val_epoch + 1}\n")
+            f.write(f"Overfitting Detected: {'Yes' if overfitting_detected else 'No'}\n")
+
+            # 提供建议
+            if overfitting_detected:
+                f.write("Recommendation: Consider early stopping, regularization, or data augmentation\n")
+            elif loss_gap > 0.5:  # 较大的损失差距
+                f.write("Recommendation: Model may be overfitting, consider reducing model complexity\n")
+            else:
+                f.write("Recommendation: Training appears well-balanced\n")
+
+    def plot_combined_confusion_matrices(self, y_true, y_pred, phase='test', fold=0):
+        """绘制所有类别的混淆矩阵在同一张图片上"""
+        n_classes = len(self.class_names)
+        rows = (n_classes + 2) // 3  # 每行3个，计算需要的行数
+        cols = min(n_classes, 3)
+
+        fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 5 * rows))
+        if n_classes > 1:
+            axes = axes.flatten()
+        else:
+            axes = [axes]
+
+        for i, class_name in enumerate(self.class_names):
+            ax = axes[i]
+            true_class = y_true[:, i]
+            pred_class = y_pred[:, i] > 0.5
+
+            cm = confusion_matrix(true_class, pred_class)
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
+                        cbar=False, square=True)
+
+            # 计算并显示F1分数
+            f1 = f1_score(true_class, pred_class, zero_division=0)
+            ax.set_title(f'{class_name}\nF1: {f1:.3f}', fontsize=12, fontweight='bold')
+            ax.set_xlabel('Predicted')
+            ax.set_ylabel('Actual')
+
+        # 隐藏多余的子图
+        for i in range(n_classes, len(axes)):
+            axes[i].set_visible(False)
+
+        plt.suptitle(f'Per-Class Confusion Matrices - {phase} (Fold {fold})',
+                     fontsize=16, fontweight='bold', y=0.98)
+        plt.tight_layout()
+
+        # 保存图片
+        cm_path = os.path.join(self.current_result_dir, f'combined_confusion_matrix.png')
+        plt.savefig(cm_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+        return fig
+
+    def plot_combined_roc_pr_curves(self, y_true, y_pred_proba, phase='test', fold=0):
+        """绘制所有类别的ROC曲线和PR曲线在同一张图片上"""
+        from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score
+
+        n_classes = len(self.class_names)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
+
+        # 设置颜色循环
+        colors = plt.cm.Set3(np.linspace(0, 1, n_classes))
+
+        # ROC曲线
+        for i in range(n_classes):
+            fpr, tpr, _ = roc_curve(y_true[:, i], y_pred_proba[:, i])
+            roc_auc = auc(fpr, tpr)
+
+            ax1.plot(fpr, tpr, color=colors[i], lw=2,
+                     label=f'{self.class_names[i]} (AUC = {roc_auc:.3f})')
+
+        ax1.plot([0, 1], [0, 1], 'k--', alpha=0.5, lw=2)
+        ax1.set_xlim([0.0, 1.0])
+        ax1.set_ylim([0.0, 1.05])
+        ax1.set_xlabel('False Positive Rate', fontsize=12)
+        ax1.set_ylabel('True Positive Rate', fontsize=12)
+        ax1.set_title(f'ROC Curves - {phase} (Fold {fold})', fontsize=14, fontweight='bold')
+        ax1.legend(loc="lower right", fontsize=10)
+        ax1.grid(True, alpha=0.3)
+
+        # PR曲线
+        for i in range(n_classes):
+            precision, recall, _ = precision_recall_curve(y_true[:, i], y_pred_proba[:, i])
+            ap = average_precision_score(y_true[:, i], y_pred_proba[:, i])
+
+            ax2.plot(recall, precision, color=colors[i], lw=2,
+                     label=f'{self.class_names[i]} (AP = {ap:.3f})')
+
+        ax2.set_xlim([0.0, 1.0])
+        ax2.set_ylim([0.0, 1.05])
+        ax2.set_xlabel('Recall', fontsize=12)
+        ax2.set_ylabel('Precision', fontsize=12)
+        ax2.set_title(f'Precision-Recall Curves - {phase} (Fold {fold})', fontsize=14, fontweight='bold')
+        ax2.legend(loc="lower left", fontsize=10)
+        ax2.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        # 保存图片
+        roc_pr_path = os.path.join(self.current_result_dir, f'combined_roc_pr_curves.png')
+        plt.savefig(roc_pr_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+        return fig
+
+    # def plot_performance_summary(self, y_true, y_pred_proba, fold=0):
+    #     """绘制性能指标汇总图"""
+    #     n_classes = len(self.class_names)
+    #     metrics = ['Precision', 'Recall', 'F1-Score', 'AUC']
+    #     data = np.zeros((n_classes, len(metrics)))
+    #
+    #     for i in range(n_classes):
+    #         true_class = y_true[:, i]
+    #         pred_class = y_pred_proba[:, i] > 0.5
+    #
+    #         data[i, 0] = precision_score(true_class, pred_class, zero_division=0)
+    #         data[i, 1] = recall_score(true_class, pred_class, zero_division=0)
+    #         data[i, 2] = f1_score(true_class, pred_class, zero_division=0)
+    #         data[i, 3] = roc_auc_score(true_class, y_pred_proba[:, i])
+    #
+    #     # 创建热力图
+    #     fig, ax = plt.subplots(figsize=(12, 8))
+    #     im = ax.imshow(data, cmap='YlOrRd', aspect='auto', vmin=0, vmax=1)
+    #
+    #     # 设置坐标轴
+    #     ax.set_xticks(range(len(metrics)))
+    #     ax.set_xticklabels(metrics, fontsize=12)
+    #     ax.set_yticks(range(n_classes))
+    #     ax.set_yticklabels(self.class_names, fontsize=12)
+    #
+    #     # 在热力图中显示数值
+    #     for i in range(n_classes):
+    #         for j in range(len(metrics)):
+    #             color = "white" if data[i, j] > 0.6 else "black"
+    #             text = ax.text(j, i, f'{data[i, j]:.3f}',
+    #                            ha="center", va="center", color=color, fontweight='bold')
+    #
+    #     ax.set_title(f'Performance Metrics Summary (Fold {fold})', fontsize=16, fontweight='bold')
+    #     plt.colorbar(im, ax=ax)
+    #     plt.tight_layout()
+    #
+    #     # 保存图片
+    #     summary_path = os.path.join(self.current_result_dir, f'performance_summary.png')
+    #     plt.savefig(summary_path, dpi=300, bbox_inches='tight')
+    #     plt.close()
+    #
+    #     return fig
+
+    def plot_performance_summary(self, y_true, y_pred_proba, fold=0):
+        n_classes = len(self.class_names)
+        metrics = ['Precision', 'Recall', 'F1', 'AUC']
+        data = np.zeros((n_classes, len(metrics)))
+
+        for i in range(n_classes):
+            true_class = y_true[:, i]
+            pred_class = y_pred_proba[:, i] > 0.5
+            data[i, 0] = precision_score(true_class, pred_class, zero_division=0)
+            data[i, 1] = recall_score(true_class, pred_class, zero_division=0)
+            data[i, 2] = f1_score(true_class, pred_class, zero_division=0)
+            data[i, 3] = roc_auc_score(true_class, y_pred_proba[:, i])
+
+        fig, ax = plt.subplots(figsize=(6.4, 4.5))
+        im = ax.imshow(data, cmap='YlOrRd', aspect='auto', vmin=0, vmax=1)
+
+        ax.set_xticks(range(len(metrics)))
+        ax.set_xticklabels(metrics, fontsize=12)
+        ax.set_yticks(range(n_classes))
+        ax.set_yticklabels(self.class_names, fontsize=12)
+
+        for i in range(n_classes):
+            for j in range(len(metrics)):
+                color = "white" if data[i, j] > 0.6 else "black"
+                text = ax.text(j, i, f'{data[i, j]:.3f}', ha="center", va="center",
+                               color=color, fontweight='bold', fontsize=11)
+
+        # 添加右侧的 Colorbar
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.ax.tick_params(labelsize=11)
+
+        # 删除大标题
+        # ax.set_title(...) 已经被移除
+
+        plt.tight_layout()
+
+        summary_path = os.path.join(self.current_result_dir, f'performance_summary.png')
+        plt.savefig(summary_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+        return fig
+
+    def comprehensive_visualization(self, y_true, y_pred_proba, net, test_loader, fold=0):
+        """执行全面的可视化"""
+        print(f"Generating comprehensive visualizations for fold {fold}...")
+
+        # 生成所有可视化图表
+        cm_fig = self.plot_combined_confusion_matrices(y_true, y_pred_proba, 'test', fold)
+        roc_pr_fig = self.plot_combined_roc_pr_curves(y_true, y_pred_proba, 'test', fold)
+        summary_fig = self.plot_performance_summary(y_true, y_pred_proba, fold)
+
+        self.writer.add_figure('Visualization/Combined_Confusion_Matrix', cm_fig, 0)
+        self.writer.add_figure('Visualization/Combined_ROC_PR_Curves', roc_pr_fig, 0)
+        self.writer.add_figure('Visualization/Performance_Summary', summary_fig, 0)
+
+        print(f"Visualizations saved to: {self.current_result_dir}")
+
+        return {
+            'confusion_matrix': cm_fig,
+            'roc_pr_curves': roc_pr_fig,
+            'performance_summary': summary_fig
+        }
+
+    def train_epoch(self, train_loader, net, criterion, optimizer, epoch, fold=0):
+        net.train()
+        running_loss = 0.0
+        all_outputs = []
+        all_labels = []
+
+        for data, labels in tqdm(train_loader, desc=f'Epoch {epoch}'):
+            data, labels = data.to(self.device), labels.to(self.device)
+            optimizer.zero_grad()
+            logits, _ = net(data)
+            loss = criterion(logits, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=self.args.grad_clip)
+            optimizer.step()
+            running_loss += loss.item()
+            outputs = torch.sigmoid(logits)
+            # === 新增：强制清理 NaN 和 Inf ===
+            if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                logging.warning(f"NaN or Inf detected in model output at epoch {epoch}")
+                outputs = torch.nan_to_num(outputs, nan=0.0, posinf=1.0, neginf=0.0)
+            # ====================================
+            all_outputs.append(outputs.detach().cpu().numpy())
+            all_labels.append(labels.detach().cpu().numpy())
+
+        avg_loss = running_loss / len(train_loader)
+        all_outputs = np.vstack(all_outputs)
+        all_labels = np.vstack(all_labels)
+        f1s = cal_f1s(all_labels, all_outputs)
+        avg_f1 = np.mean(f1s)
+
+        self.writer.add_scalar('Loss/Train', avg_loss, epoch)
+        self.writer.add_scalar('F1/Train', avg_f1, epoch)
+        for i, f1 in enumerate(f1s):
+            self.writer.add_scalar(f'F1/Train/Class_{self.class_names[i]}', f1, epoch)
+        for param_group in optimizer.param_groups:
+            self.writer.add_scalar('LR', param_group['lr'], epoch)
+
+        self.train_losses.append(avg_loss)
+        self.train_f1s.append(avg_f1)
+
+        # Log metrics in tabular format
+        with open(self.metrics_log_path, 'a') as f:
+            f.write(f"{fold:>4} | {epoch:>5} | {avg_loss:>10.4f} | {avg_f1:>8.4f} | {'':>8} | {'':>6} | {'':>6}\n")
+
+        return avg_loss, avg_f1
+
+    def validate(self, val_loader, net, criterion, epoch, phase='val', fold=0):
+        net.eval()
+        running_loss = 0.0
+        all_outputs = []
+        all_labels = []
+
+        with torch.no_grad():
+            for data, labels in val_loader:
+                data, labels = data.to(self.device), labels.to(self.device)
+                logits, _ = net(data)
+                loss = criterion(logits, labels)
+                running_loss += loss.item()
+                outputs = torch.sigmoid(logits)
+                # === 新增：强制清理 NaN 和 Inf ===
+                if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                    logging.warning(f"NaN or Inf detected in model output at epoch {epoch}")
+                    outputs = torch.nan_to_num(outputs, nan=0.0, posinf=1.0, neginf=0.0)
+                # ====================================
+                all_outputs.append(outputs.detach().cpu().numpy())
+                all_labels.append(labels.detach().cpu().numpy())
+
+        avg_loss = running_loss / len(val_loader)
+        all_outputs = np.vstack(all_outputs)
+        all_labels = np.vstack(all_labels)
+        f1s = cal_f1s(all_labels, all_outputs)
+        avg_f1 = np.mean(f1s)
+        aucs = cal_aucs(all_labels, all_outputs)
+        avg_auc = np.mean(aucs)
+        precision, recall, f1_per_class, _ = precision_recall_fscore_support(
+            all_labels, all_outputs > 0.5, average=None, labels=range(len(self.class_names))
+        )
+
+        self.writer.add_scalar(f'Loss/{phase}', avg_loss, epoch)
+        self.writer.add_scalar(f'F1/{phase}', avg_f1, epoch)
+        self.writer.add_scalar(f'AUC/{phase}', avg_auc, epoch)
+        for i, (p, r, f) in enumerate(zip(precision, recall, f1_per_class)):
+            self.writer.add_scalar(f'Precision/{phase}/Class_{self.class_names[i]}', p, epoch)
+            self.writer.add_scalar(f'Recall/{phase}/Class_{self.class_names[i]}', r, epoch)
+            self.writer.add_scalar(f'F1/{phase}/Class_{self.class_names[i]}', f, epoch)
+
+        self.val_losses.append(avg_loss)
+        self.val_f1s.append(avg_f1)
+
+        # Complete metric line for validation
+        with open(self.metrics_log_path, 'a') as f:
+            f.write(
+                f"{fold:>4} | {epoch:>5} | {'':>10} | {'':>8} | {avg_loss:>8.4f} | {avg_f1:>6.4f} | {avg_auc:>6.4f}\n")
+
+        if phase == 'test':
+            # 执行全面的可视化
+            figures = self.comprehensive_visualization(all_labels, all_outputs, net, val_loader, fold)
+
+            # Per-class metrics table
+            cm = [confusion_matrix(all_labels[:, i], (all_outputs[:, i] > 0.5).astype(int)) for i in
+                  range(len(self.class_names))]
+            per_class_acc = [np.diag(cm[i]) / np.sum(cm[i], axis=1) if np.sum(cm[i], axis=1).any() else np.array([0.0])
+                             for i in range(len(self.class_names))]
+            with open(self.metrics_log_path, 'a') as f:
+                f.write(f"\n=== Fold {fold} Test Results ===\n")
+                f.write(f"Loss: {avg_loss:.4f} | F1: {avg_f1:.4f} | AUC: {avg_auc:.4f}\n")
+                f.write(f"Visualizations saved to: {self.current_result_dir}\n")
+                f.write("\n=== Per-Class Metrics ===\n")
+                f.write("Class | Name               | Accuracy | Precision | Recall | F1\n")
+                for i, acc in enumerate(per_class_acc):
+                    acc_val = acc[0] if acc.size > 0 else 0.0
+                    f.write(
+                        f"{i:>5} | {self.class_names[i]:>15} | {acc_val:>8.4f} | {precision[i]:>9.4f} | {recall[i]:>6.4f} | {f1_per_class[i]:>6.4f}\n")
+
+        return avg_loss, avg_f1, avg_auc, all_outputs, all_labels
+
+    def early_stopping(self, current_metric, patience=None):
+        if patience is None:
+            patience = self.args.early_stopping
+        if current_metric > self.best_metric:
+            self.best_metric = current_metric
+            self.epochs_no_improve = 0
+            return False
+        else:
+            self.epochs_no_improve += 1
+            if self.epochs_no_improve >= patience:
+                with open(self.metrics_log_path, 'a') as f:
+                    f.write(f"Early stopping triggered after {self.epochs_no_improve} epochs without improvement\n")
+                return True
+            return False
+
+    def save_checkpoint(self, net, optimizer, scheduler, epoch, is_best=False, fold=0):
+        state = {
+            'epoch': epoch,
+            'state_dict': net.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'best_metric': self.best_metric,
+            'args': vars(self.args)
+        }
+        filename = f'checkpoint_fold{fold}.pth' if not is_best else f'best_model_fold{fold}.pth'
+        torch.save(state, os.path.join(self.args.log_dir, 'models', filename))
+
+    def load_checkpoint(self, net, optimizer, scheduler, fold=0):
+        filename = os.path.join(self.args.log_dir, 'models', f'best_model_fold{fold}.pth')
+        if os.path.exists(filename):
+            checkpoint = torch.load(filename, map_location=self.device)
+            net.load_state_dict(checkpoint['state_dict'])
+            if optimizer is not None:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+            if scheduler is not None:
+                scheduler.load_state_dict(checkpoint['scheduler'])
+            self.best_metric = checkpoint['best_metric']
+            return checkpoint['epoch']
+        return 0
+
+
+def get_class_distribution(dataset, fold, metrics_log_path, class_names):
+    all_labels = []
+    for i in range(len(dataset)):
+        try:
+            _, label = dataset[i]
+            all_labels.append(label.cpu().numpy())
+        except Exception as e:
+            with open(metrics_log_path, 'a') as f:
+                f.write(f"Error in get_class_distribution for fold {fold}, index {i}: {e}\n")
+            continue
+    all_labels = np.vstack(all_labels) if all_labels else np.zeros((0, len(class_names)))
+    label_counts = all_labels.sum(axis=0)
+    total_samples = len(dataset)
+    with open(metrics_log_path, 'a') as f:
+        f.write(f"\n=== Fold {fold} Training Set Class Distribution ===\n")
+        f.write("Class | Name               | Samples | Proportion\n")
+        for class_id, count in enumerate(label_counts):
+            proportion = count / total_samples if total_samples > 0 else 0.0
+            class_name = class_names[class_id]
+            f.write(f"{class_id:>5} | {class_name:>15} | {int(count):>7} | {proportion:>10.4f}\n")
+        f.write("\n")
+
+
+def train_single_fold(args, train_dataset, val_dataset, test_dataset, device, fold=0, metrics_log_path=None):
+    class_names = ['NORM', 'ABNORM']
+    trainer = Trainer(args, device, metrics_log_path, class_names)
+
+    try:
+        # train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
+        #                           pin_memory=True)
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
+                                  pin_memory=True, drop_last=True)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
+                                pin_memory=True)
+        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
+                                 pin_memory=True)
+    except Exception as e:
+        with open(metrics_log_path, 'a') as f:
+            f.write(f"Failed to create data loaders for fold {fold}: {e}\n")
+        raise
+
+    nleads = 12 if args.leads == 'all' else len(args.leads.split(','))
+    # net = LSTMECG(input_channels=nleads).to(device)
+    # net = resnet18_enhanced(input_channels=nleads).to(device)
+    net = DualBranchResNet(input_channels=nleads).to(device)
+    params = trainer.count_parameters(net)
+
+    with open(metrics_log_path, 'a') as f:
+        f.write(f"\n=== Fold {fold} ===\n")
+        f.write(f"Model: ImprovedECGModel\n")
+        f.write(f"Parameters: {params:.2f}M\n")
+
+    optimizer = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6)
+
+    if args.class_weight:
+        class_weights = trainer.calculate_class_weights(train_dataset)
+        criterion = FocalLoss(alpha=class_weights, gamma=2.0)
+        with open(metrics_log_path, 'a') as f:
+            f.write(f"Class weights: {class_weights.cpu().numpy()}\n")
+    else:
+        criterion = nn.BCEWithLogitsLoss()
+
+    # Log class distribution
+    get_class_distribution(train_dataset, fold, metrics_log_path, class_names)
+
+    start_epoch = 0
+    if args.resume:
+        start_epoch = trainer.load_checkpoint(net, optimizer, scheduler, fold)
+
+    for epoch in range(start_epoch, args.epochs):
+        train_loss, train_f1 = trainer.train_epoch(train_loader, net, criterion, optimizer, epoch, fold)
+        val_loss, val_f1, val_auc, _, _ = trainer.validate(val_loader, net, criterion, epoch, 'val', fold)
+        scheduler.step(val_loss)
+
+        if trainer.early_stopping(val_f1):
+            break
+
+        is_best = val_f1 > trainer.best_metric
+        trainer.save_checkpoint(net, optimizer, scheduler, epoch, is_best, fold)
+
+    # 训练结束后绘制学习曲线
+    trainer.plot_learning_curves(fold)
+
+    trainer.load_checkpoint(net, None, None, fold)
+    test_loss, test_f1, test_auc, test_outputs, test_labels = trainer.validate(test_loader, net, criterion, 0, 'test',
+                                                                               fold)
+
+    history = {
+        'train_loss': trainer.train_losses,
+        'val_loss': trainer.val_losses,
+        'train_f1': trainer.train_f1s,
+        'val_f1': trainer.val_f1s,
+        'test_metrics': {'loss': test_loss, 'f1': test_f1, 'auc': test_auc}
+    }
+    with open(os.path.join(args.log_dir, f'history_fold_{fold}.json'), 'w') as f:
+        json.dump(history, f, indent=2)
+
+    trainer.writer.close()
+    return test_f1, test_auc
+
+
+def kfold_cross_validation(args, full_dataset, device, metrics_log_path):
+    if args.k_fold < 2:
+        raise ValueError(f"Number of folds (k_fold={args.k_fold}) must be at least 2 for K-Fold cross-validation.")
+
+    indices = list(range(len(full_dataset)))
+    train_val_indices, test_indices = train_test_split(indices, test_size=args.test_size, random_state=args.seed)
+    test_dataset = Subset(full_dataset, test_indices)
+
+    kfold = KFold(n_splits=args.k_fold, shuffle=True, random_state=args.seed)
+    fold_results = {'f1': [], 'auc': []}
+
+    for fold, (train_idx, val_idx) in enumerate(kfold.split(train_val_indices)):
+        print(f'Starting fold {fold + 1}/{args.k_fold}')
+        train_indices = [train_val_indices[i] for i in train_idx]
+        val_indices = [train_val_indices[i] for i in val_idx]
+        train_subset = Subset(full_dataset, train_indices)
+        val_subset = Subset(full_dataset, val_indices)
+        test_f1, test_auc = train_single_fold(args, train_subset, val_subset, test_dataset, device, fold,
+                                              metrics_log_path)
+        fold_results['f1'].append(test_f1)
+        fold_results['auc'].append(test_auc)
+
+    with open(metrics_log_path, 'a') as f:
+        f.write("\n=== Cross-Validation Summary ===\n")
+        f.write(f"f1: Mean = {np.mean(fold_results['f1']):.4f}, Std = {np.std(fold_results['f1']):.4f}\n")
+        f.write(f"auc: Mean = {np.mean(fold_results['auc']):.4f}, Std = {np.std(fold_results['auc']):.4f}\n")
+
+    with open(os.path.join(args.log_dir, 'cv_results.json'), 'w') as f:
+        json.dump(fold_results, f, indent=2)
+
+    return fold_results
+
+
+def main():
+    args = parse_args()
+    device = torch.device('cuda:0' if args.use_gpu and torch.cuda.is_available() else 'cpu')
+
+    # timestamp = datetime.datetime.now().strftime('%H_%M')
+    # args.log_dir = os.path.join(args.log_dir, f'{args.experiment}_{timestamp}')
+    args.log_dir = os.path.join(args.log_dir, args.result_dir)
+    os.makedirs(args.log_dir, exist_ok=True)
+
+    metrics_log_path = os.path.join(args.log_dir, f"{args.run_description}.log")
+    mode = f"{args.k_fold}-Fold Cross-Validation" if args.k_fold >= 2 else "Single Train/Val"
+
+    with open(metrics_log_path, 'w') as f:
+        f.write(f"Model: DualBranchResNet\n")
+        f.write(f"Dataset: PTB-XL (2 classes)\n")
+        f.write(f"Mode: {mode}\n")
+        f.write(f"Hyperparameters: {vars(args)}\n")
+        f.write("\n=== Training Metrics ===\n")
+        f.write("Fold | Epoch | Train Loss | Train F1 | Val Loss | Val F1 | Val AUC\n")
+        f.write("=" * 60 + "\n")
+
+    with open(os.path.join(args.log_dir, 'args.json'), 'w') as f:
+        json.dump(vars(args), f, indent=2)
+
+    # ======================== 新增参数使用 ========================
+    # processed_dir：预处理后 .npy 文件所在文件夹（必须）
+    processed_dir = args.processed_dir
+
+    # label_csv：标签文件路径，如果未指定则自动在 processed_dir 中查找
+    label_csv = args.label_csv or os.path.join(processed_dir, 'labels_2class.csv')
+
+    # 路径检查，提前报错避免后续卡住
+    if not os.path.exists(processed_dir):
+        raise FileNotFoundError(f"预处理文件夹不存在，请检查 --processed-dir 参数:\n{processed_dir}")
+    if not os.path.exists(label_csv):
+        raise FileNotFoundError(f"标签文件不存在，请检查路径:\n{label_csv}")
+
+    logging.info(f"使用预处理文件夹: {processed_dir}")
+    logging.info(f"使用标签文件: {label_csv}")
+
+    try:
+        if args.phase == 'test':
+            if not os.path.exists(args.model_path):
+                raise FileNotFoundError(f"Model path {args.model_path} does not exist")
+
+            test_dataset = ECGDataset(
+                phase='test',
+                processed_dir=processed_dir,
+                label_csv=label_csv,
+                folds=None,  # test 模式通常不限 fold，或根据需要指定
+                leads=args.leads,
+                signal_length=args.signal_length,
+                apply_augmentation=False
+            )
+
+            test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False,
+                                     num_workers=args.num_workers, pin_memory=True)
+
+            nleads = 12 if args.leads == 'all' else len(args.leads.split(','))
+            net = DualBranchResNet(input_channels=nleads).to(device)
+            net.load_state_dict(torch.load(args.model_path, map_location=device)['state_dict'])
+
+            class_names = ['NORM', 'ABNORM']
+            trainer = Trainer(args, device, metrics_log_path, class_names)
+
+            criterion = nn.BCEWithLogitsLoss()
+            test_loss, test_f1, test_auc, _, _ = trainer.validate(test_loader, net, criterion, 0, 'test', 0)
+
+            with open(metrics_log_path, 'a') as f:
+                f.write(f"\n=== Test Results ===\n")
+                f.write(f"Loss: {test_loss:.4f} | F1: {test_f1:.4f} | AUC: {test_auc:.4f}\n")
+
+        else:
+            # ======================== 训练 / 验证 / K-Fold ========================
+            if args.k_fold >= 2:
+                # K-Fold 交叉验证：使用全部数据，按 strat_fold 分
+                full_dataset = ECGDataset(
+                    phase='all',  # 自定义 phase，表示加载全部
+                    processed_dir=processed_dir,
+                    label_csv=label_csv,
+                    folds=None,  # 不筛选 fold，kfold 内部处理
+                    leads=args.leads,
+                    signal_length=args.signal_length,
+                    apply_augmentation=False  # augmentation 在子集里控制
+                )
+                kfold_cross_validation(args, full_dataset, device, metrics_log_path)
+
+            else:
+                # 单次训练：手动划分或使用官方 strat_fold
+                # 这里使用官方推荐划分：fold 0~7 训练，8 验证，9 测试
+                train_dataset = ECGDataset(
+                    phase='train',
+                    processed_dir=processed_dir,
+                    label_csv=label_csv,
+                    folds=list(range(0, 8)),  # fold 0~7
+                    leads=args.leads,
+                    signal_length=args.signal_length,
+                    apply_augmentation=True,
+                    apply_class_weights=args.class_weight
+                )
+
+                val_dataset = ECGDataset(
+                    phase='val',
+                    processed_dir=processed_dir,
+                    label_csv=label_csv,
+                    folds=[8],  # fold 8
+                    leads=args.leads,
+                    signal_length=args.signal_length,
+                    apply_augmentation=False
+                )
+
+                test_dataset = ECGDataset(
+                    phase='test',
+                    processed_dir=processed_dir,
+                    label_csv=label_csv,
+                    folds=[9],  # fold 9
+                    leads=args.leads,
+                    signal_length=args.signal_length,
+                    apply_augmentation=False
+                )
+
+                test_f1, test_auc = train_single_fold(
+                    args=args,
+                    train_dataset=train_dataset,
+                    val_dataset=val_dataset,
+                    test_dataset=test_dataset,
+                    device=device,
+                    fold=0,
+                    metrics_log_path=metrics_log_path
+                )
+
+                with open(metrics_log_path, 'a') as f:
+                    f.write(f"\n=== Final Test Results ===\n")
+                    f.write(f"F1: {test_f1:.4f} | AUC: {test_auc:.4f}\n")
+
+    except Exception as e:
+        logging.error(f"Training failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+        with open(metrics_log_path, 'a') as f:
+            f.write(f"\n=== ERROR ===\n{traceback.format_exc()}\n")
+        raise
+
+
+if __name__ == "__main__":
+    main()
