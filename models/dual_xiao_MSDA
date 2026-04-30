@@ -1,0 +1,611 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+
+# ==================== MLLA 模块 ====================
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class DropPath(nn.Module):
+    def __init__(self, drop_prob=0.):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if self.drop_prob == 0. or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x.div(keep_prob) * random_tensor
+
+
+class RoPE1D(nn.Module):
+    """1D版本的旋转位置编码，适用于ECG信号"""
+
+    def __init__(self, dim, base=10000):
+        super(RoPE1D, self).__init__()
+        self.dim = dim
+        self.base = base
+
+    def forward(self, x):
+        # x: [B, L, dim]
+        B, L, D = x.shape
+        position = torch.arange(L, dtype=torch.float32, device=x.device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.dim, 2, dtype=torch.float32, device=x.device) *
+                             (-math.log(self.base) / self.dim))
+
+        pe = torch.zeros(L, self.dim, device=x.device)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        return x + pe.unsqueeze(0)
+
+
+class LinearAttention1D(nn.Module):
+    """1D版本的线性注意力，适用于ECG信号"""
+
+    def __init__(self, dim, num_heads, qkv_bias=True):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
+
+        self.qk = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.elu = nn.ELU()
+        self.lepe = nn.Conv1d(dim, dim, 3, padding=1, groups=dim)
+        self.rope = RoPE1D(dim=dim)
+
+    def forward(self, x):
+        B, L, C = x.shape
+
+        # 生成Q, K
+        qk = self.qk(x).reshape(B, L, 2, C).permute(2, 0, 1, 3)
+        q, k = qk[0], qk[1]
+
+        # ELU激活确保非负性
+        q = self.elu(q) + 1.0
+        k = self.elu(k) + 1.0
+
+        # 应用位置编码
+        q_rope = self.rope(q)
+        k_rope = self.rope(k)
+
+        # 重塑为多头
+        q_rope = q_rope.reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k_rope = k_rope.reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        q = q.reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = k.reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = x.reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        # 线性注意力计算
+        z = 1 / (torch.einsum('bhid,bhjd->bhij', q, k.mean(dim=2, keepdim=True)) + 1e-6)
+        kv = torch.einsum('bhjd,bhje->bhde', k_rope * (L ** -0.5), v * (L ** -0.5))
+        x = torch.einsum('bhid,bhde->bhie', q_rope, kv) * z
+
+        # 输出重塑
+        x = x.transpose(1, 2).reshape(B, L, C)
+
+        # 添加局部位置编码
+        v_reshaped = v.transpose(1, 2).reshape(B, L, C).permute(0, 2, 1)
+        x = x + self.lepe(v_reshaped).permute(0, 2, 1)
+
+        return x
+
+
+class MLLABlock1D(nn.Module):
+    """1D版本的MLLA模块，适用于ECG信号"""
+
+    def __init__(self, dim, num_heads=8, mlp_ratio=4., qkv_bias=True,
+                 drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.mlp_ratio = mlp_ratio
+
+        # 条件位置编码
+        self.cpe1 = nn.Conv1d(dim, dim, 3, padding=1, groups=dim)
+        self.norm1 = norm_layer(dim)
+
+        # 门控投影
+        self.in_proj = nn.Linear(dim, dim)
+        self.act_proj = nn.Linear(dim, dim)
+        self.dwc = nn.Conv1d(dim, dim, 3, padding=1, groups=dim)
+        self.act = nn.SiLU()
+
+        # 线性注意力
+        self.attn = LinearAttention1D(dim=dim, num_heads=num_heads, qkv_bias=qkv_bias)
+        self.out_proj = nn.Linear(dim, dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        # 第二个条件位置编码
+        self.cpe2 = nn.Conv1d(dim, dim, 3, padding=1, groups=dim)
+        self.norm2 = norm_layer(dim)
+        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio),
+                       act_layer=act_layer, drop=drop)
+
+    def forward(self, x):
+        B, L, C = x.shape
+
+        # 第一个条件位置编码
+        x = x + self.cpe1(x.permute(0, 2, 1)).permute(0, 2, 1)
+        shortcut = x
+
+        # 归一化和门控
+        x = self.norm1(x)
+        act_res = self.act(self.act_proj(x))
+
+        # 深度可分离卷积
+        x_proj = self.in_proj(x).permute(0, 2, 1)
+        x_proj = self.act(self.dwc(x_proj)).permute(0, 2, 1)
+
+        # 线性注意力
+        x_attn = self.attn(x_proj)
+
+        # 输出投影和门控
+        x_out = self.out_proj(x_attn * act_res)
+        x = shortcut + self.drop_path(x_out)
+
+        # 第二个条件位置编码
+        x = x + self.cpe2(x.permute(0, 2, 1)).permute(0, 2, 1)
+
+        # MLP
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+
+        return x
+
+
+# ==================== HiLo 注意力模块 ====================
+class HiLo(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.2, window_size=3,
+                 alpha=0.5):
+        super().__init__()
+        assert dim % num_heads == 0, f"dim {dim} should be divided by num_heads {num_heads}."
+        head_dim = int(dim / num_heads)
+        self.dim = dim
+
+        # self-attention heads in Lo-Fi
+        self.l_heads = int(num_heads * alpha)
+        # token dimension in Lo-Fi
+        self.l_dim = self.l_heads * head_dim
+
+        # self-attention heads in Hi-Fi
+        self.h_heads = num_heads - self.l_heads
+        # token dimension in Hi-Fi
+        self.h_dim = self.h_heads * head_dim
+
+        # local window size. The `s` in our paper.
+        self.ws = window_size
+
+        if self.ws == 1:
+            # ws == 1 is equal to a standard multi-head self-attention
+            self.h_heads = 0
+            self.h_dim = 0
+            self.l_heads = num_heads
+            self.l_dim = dim
+
+        self.scale = qk_scale or head_dim ** -0.5
+
+        # Low frequence attention (Lo-Fi)
+        if self.l_heads > 0:
+            if self.ws != 1:
+                self.sr = nn.AvgPool2d(kernel_size=window_size, stride=window_size)
+            self.l_q = nn.Linear(self.dim, self.l_dim, bias=qkv_bias)
+            self.l_kv = nn.Linear(self.dim, self.l_dim * 2, bias=qkv_bias)
+            self.l_proj = nn.Linear(self.l_dim, self.l_dim)
+
+        # High frequence attention (Hi-Fi)
+        if self.h_heads > 0:
+            self.h_qkv = nn.Linear(self.dim, self.h_dim * 3, bias=qkv_bias)
+            self.h_proj = nn.Linear(self.h_dim, self.h_dim)
+
+    def hifi(self, x):
+        B, H, W, C = x.shape
+        h_group, w_group = H // self.ws, W // self.ws
+
+        total_groups = h_group * w_group
+
+        x = x.reshape(B, h_group, self.ws, w_group, self.ws, C).transpose(2, 3)
+
+        qkv = self.h_qkv(x).reshape(B, total_groups, -1, 3, self.h_heads, self.h_dim // self.h_heads).permute(3, 0, 1,
+                                                                                                              4, 2, 5)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # B, hw, n_head, ws*ws, head_dim
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # B, hw, n_head, ws*ws, ws*ws
+        attn = attn.softmax(dim=-1)
+        attn = (attn @ v).transpose(2, 3).reshape(B, h_group, w_group, self.ws, self.ws, self.h_dim)
+        x = attn.transpose(2, 3).reshape(B, h_group * self.ws, w_group * self.ws, self.h_dim)
+
+        x = self.h_proj(x)
+        return x
+
+    def lofi(self, x):
+        B, H, W, C = x.shape
+
+        q = self.l_q(x).reshape(B, H * W, self.l_heads, self.l_dim // self.l_heads).permute(0, 2, 1, 3)
+
+        if self.ws > 1:
+            x_ = x.permute(0, 3, 1, 2)
+            x_ = self.sr(x_).reshape(B, C, -1).permute(0, 2, 1)
+            kv = self.l_kv(x_).reshape(B, -1, 2, self.l_heads, self.l_dim // self.l_heads).permute(2, 0, 3, 1, 4)
+        else:
+            kv = self.l_kv(x).reshape(B, -1, 2, self.l_heads, self.l_dim // self.l_heads).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, H, W, self.l_dim)
+        x = self.l_proj(x)
+        return x
+
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+
+        x = x.reshape(B, H, W, C)
+
+        if self.h_heads == 0:
+            x = self.lofi(x)
+            return x.reshape(B, N, C)
+
+        if self.l_heads == 0:
+            x = self.hifi(x)
+            return x.reshape(B, N, C)
+
+        hifi_out = self.hifi(x)
+        lofi_out = self.lofi(x)
+
+        x = torch.cat((hifi_out, lofi_out), dim=-1)
+        x = x.reshape(B, N, C)
+
+        return x
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, window_size=1, alpha=0.5, qkv_bias=False, qk_scale=None, attn_drop=0.,
+                 proj_drop=0.):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = HiLo(dim=dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop,
+                         proj_drop=proj_drop, window_size=window_size, alpha=alpha)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim)
+        )
+        self.drop_path = nn.Identity()
+
+    def forward(self, x, H, W):
+        shortcut = x
+        x = self.norm1(x)
+        x = self.attn(x, H, W)
+        x = shortcut + self.drop_path(x)
+        shortcut = x
+        x = self.norm2(x)
+        x = self.ffn(x)
+        x = shortcut + self.drop_path(x)
+        return x
+
+
+class HiLoTransformerFusion(nn.Module):
+    def __init__(self, dim, num_layers=1, num_heads=8, window_size=1, alpha=0.5, dropout_rate=0.1):
+        super().__init__()
+        self.dim = dim
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList([
+            TransformerBlock(dim=dim, num_heads=num_heads, window_size=window_size, alpha=alpha)
+            for _ in range(num_layers)
+        ])
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x1, x2):
+        B = x1.shape[0]
+        # Treat as sequence of 2 tokens
+        tokens = torch.cat([x1.unsqueeze(1), x2.unsqueeze(1)], dim=1)  # [B, 2, dim]
+        N = tokens.shape[1]
+        H, W = N, 1  # Treat as 1D sequence
+        x = tokens
+        for layer in self.layers:
+            x = layer(x, H, W)
+        # Flatten to [B, 2*dim] to match original concatenated dimension
+        fused = x.reshape(B, -1)
+        fused = self.dropout(fused)
+        return fused
+
+
+# ==================== 其他模块 ====================
+class BasicBlock1d(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super().__init__()
+        self.conv1 = nn.Conv1d(inplanes, planes, kernel_size=7, stride=stride, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm1d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(p=0.5)
+        self.conv2 = nn.Conv1d(planes, planes, kernel_size=7, stride=1, padding=3, bias=False)
+        self.bn2 = nn.BatchNorm1d(planes)
+        self.downsample = downsample
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        if self.downsample is not None:
+            residual = self.downsample(x)
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+class BasicBlock2d(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super().__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(p=0.5)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.downsample = downsample
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        if self.downsample is not None:
+            residual = self.downsample(x)
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+class STFTBranch(nn.Module):
+    def __init__(self, input_channels=12, n_fft=96, hop_length=64, inplanes=64, num_classes=9, signal_length=15000):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.inplanes = inplanes
+        self.input_channels = input_channels
+        self.signal_length = signal_length
+
+        # Calculate expected spectrogram dimensions
+        self.freq_dim = n_fft // 2 + 1  # e.g., 49 for n_fft=96
+        self.time_dim = (signal_length - n_fft) // hop_length + 1  # e.g., 468 for signal_length=15000, hop_length=32
+
+        # STFT preprocessing layer
+        self.stft_conv = nn.Conv2d(input_channels, inplanes, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(inplanes)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        # 2D residual network layers
+        self.layer1 = self._make_layer(BasicBlock2d, 64, 2)
+        self.layer2 = self._make_layer(BasicBlock2d, 128, 2, stride=2)
+        self.layer3 = self._make_layer(BasicBlock2d, 256, 2, stride=2)
+        self.layer4 = self._make_layer(BasicBlock2d, 512, 2, stride=2)
+
+        # Adaptive pooling
+        self.adaptiveavgpool = nn.AdaptiveAvgPool2d(1)
+        self.adaptivemaxpool = nn.AdaptiveMaxPool2d(1)
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+        layers = [block(self.inplanes, planes, stride, downsample)]
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        batch_size, channels, length = x.shape
+        # Pad or truncate input to match expected signal length
+        if length != self.signal_length:
+            if length < self.signal_length:
+                x = F.pad(x, (0, self.signal_length - length))
+            else:
+                x = x[:, :, :self.signal_length]
+            length = self.signal_length
+
+        stft_features = []
+        # Generate STFT spectrograms
+        for i in range(channels):
+            channel_data = x[:, i, :]
+            stft = torch.stft(
+                channel_data,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                window=torch.hann_window(self.n_fft).to(x.device),
+                return_complex=True,
+                pad_mode='reflect'
+            )
+            magnitude = torch.abs(stft).unsqueeze(1)  # [B, 1, freq, time]
+            stft_features.append(magnitude)
+
+        x = torch.cat(stft_features, dim=1)  # [B, input_channels, freq, time]
+        x = self.stft_conv(x)  # [B, inplanes, freq//2, time//2]
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)  # [B, inplanes, freq//4, time//4]
+
+        # Residual layers
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        # Dual pooling
+        x1 = self.adaptiveavgpool(x)
+        x2 = self.adaptivemaxpool(x)
+        x = torch.cat((x1, x2), dim=1)
+        x = x.view(x.size(0), -1)
+        return x
+
+
+# ==================== 增强版双分支网络 ====================
+class DualBranchResNet(nn.Module):
+    """增强版的双分支网络，在1D分支中加入MLLA模块"""
+
+    def __init__(self, block=BasicBlock1d, layers=[2, 2, 2, 2], input_channels=12,
+                 inplanes=64, num_classes=9, signal_length=15000, use_mlla=True,
+                 mlla_heads=8, mlla_mlp_ratio=2.0):
+        super().__init__()
+        self.inplanes = inplanes
+        self.use_mlla = use_mlla
+        self.signal_length = signal_length
+
+        # 1D卷积分支
+        self.conv1 = nn.Conv1d(input_channels, inplanes, kernel_size=15, stride=2, padding=7, bias=False)
+        self.bn1 = nn.BatchNorm1d(inplanes)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+
+        # 计算经过卷积后的序列长度
+        self.final_seq_len = self._compute_final_seq_len(signal_length)
+
+        # 在1D分支后添加MLLA模块
+        if self.use_mlla:
+            self.mlla_block = MLLABlock1D(
+                dim=512,
+                num_heads=mlla_heads,
+                mlp_ratio=mlla_mlp_ratio,
+                drop=0.1
+            )
+
+        self.adaptiveavgpool = nn.AdaptiveAvgPool1d(1)
+        self.adaptivemaxpool = nn.AdaptiveMaxPool1d(1)
+
+        # STFT分支
+        self.stft_branch = STFTBranch(
+            input_channels=input_channels,
+            n_fft=96,
+            hop_length=32,
+            inplanes=inplanes,
+            signal_length=signal_length
+        )
+
+        # HiLo Transformer融合模块
+        self.fusion = HiLoTransformerFusion(dim=1024, num_layers=1, num_heads=8, window_size=1, alpha=0.5)
+
+        # 分类器
+        fusion_dim = 512 * block.expansion * 2 + 1024  # 1D分支 + STFT分支融合
+        self.fc = nn.Linear(fusion_dim, num_classes)
+        self.dropout = nn.Dropout(0.5)
+
+    def _compute_final_seq_len(self, signal_length):
+        """计算经过所有卷积层后的序列长度"""
+        # conv1: (L + 2*7 - 15)//2 + 1
+        l = (signal_length + 14 - 15) // 2 + 1
+        # maxpool: (l + 2*1 - 3)//2 + 1
+        l = (l + 2 - 3) // 2 + 1
+        # layer2: stride=2
+        l = (l + 2 - 3) // 2 + 1
+        # layer3: stride=2
+        l = (l + 2 - 3) // 2 + 1
+        # layer4: stride=2
+        l = (l + 2 - 3) // 2 + 1
+        return l
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv1d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm1d(planes * block.expansion),
+            )
+        layers = [block(self.inplanes, planes, stride, downsample)]
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        # 1D卷积分支
+        x1d = self.conv1(x)
+        x1d = self.bn1(x1d)
+        x1d = self.relu(x1d)
+        x1d = self.maxpool(x1d)
+
+        x1d = self.layer1(x1d)
+        x1d = self.layer2(x1d)
+        x1d = self.layer3(x1d)
+        x1d = self.layer4(x1d)  # [B, 512, final_seq_len]
+
+        # 应用MLLA模块
+        if self.use_mlla:
+            # 转换为序列格式 [B, seq_len, channels]
+            x1d_seq = x1d.permute(0, 2, 1)  # [B, final_seq_len, 512]
+            x1d_seq = self.mlla_block(x1d_seq)
+            # 转换回原始格式
+            x1d = x1d_seq.permute(0, 2, 1)  # [B, 512, final_seq_len]
+
+        # 双池化
+        x1d_avg = self.adaptiveavgpool(x1d)
+        x1d_max = self.adaptivemaxpool(x1d)
+        x1d = torch.cat((x1d_avg, x1d_max), dim=1)
+        x1d = x1d.view(x1d.size(0), -1)  # [B, 1024]  <-- 阶段一：时域特征
+
+        # STFT分支
+        x2d = self.stft_branch(x)  # [B, 1024]        <-- 阶段二：频域特征
+
+        # 融合两个分支的特征
+        fused = self.fusion(x1d, x2d)  # [B, 2048]
+        fused = self.dropout(fused)  # <-- 阶段三：HiLo融合特征
+
+        # 分类
+        logits = self.fc(fused)
+
+        # 阶段四：获取当前的概率分布
+        probs = torch.sigmoid(logits)
+
+        # 返回 logits 以供计算损失，同时打包返回四个阶段的特征供 t-SNE 使用
+        return logits, (x1d, x2d, fused, probs)
+
+
+def resnet18_enhanced(**kwargs):
+    return DualBranchResNet(BasicBlock1d, [2, 2, 2, 2], **kwargs)
+
+
+def resnet34_enhanced(**kwargs):
+    return DualBranchResNet(BasicBlock1d, [3, 4, 6, 3], **kwargs)
