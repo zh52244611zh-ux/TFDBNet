@@ -1,0 +1,139 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class InceptionBlock(nn.Module):
+    def __init__(self, in_channels, bottleneck_channels=64, out_channels=128, kernel_sizes=(10, 20, 40),
+                 use_maxpool=True, dropout=0.3):
+        super(InceptionBlock, self).__init__()
+        self.bottleneck = nn.Conv1d(in_channels, bottleneck_channels, kernel_size=1,
+                                    bias=False) if bottleneck_channels > 0 else nn.Identity()
+
+        # Parallel conv branches with increased out_channels for complexity
+        self.conv1 = nn.Conv1d(bottleneck_channels if bottleneck_channels > 0 else in_channels, out_channels,
+                               kernel_size=kernel_sizes[0], padding=(kernel_sizes[0] - 1) // 2, bias=False)
+        self.conv2 = nn.Conv1d(bottleneck_channels if bottleneck_channels > 0 else in_channels, out_channels,
+                               kernel_size=kernel_sizes[1], padding=(kernel_sizes[1] - 1) // 2, bias=False)
+        self.conv3 = nn.Conv1d(bottleneck_channels if bottleneck_channels > 0 else in_channels, out_channels,
+                               kernel_size=kernel_sizes[2], padding=(kernel_sizes[2] - 1) // 2, bias=False)
+
+        # Maxpool branch
+        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=1, padding=1) if use_maxpool else None
+        self.conv_maxpool = nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False) if use_maxpool else None
+
+        self.bn = nn.BatchNorm1d(out_channels * (4 if use_maxpool else 3))
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(p=dropout)
+
+        # Residual shortcut
+        self.shortcut = nn.Conv1d(in_channels, out_channels * (4 if use_maxpool else 3), kernel_size=1,
+                                  bias=False) if in_channels != out_channels * (
+            4 if use_maxpool else 3) else nn.Identity()
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+
+        y = self.bottleneck(x)
+
+        out1 = self.conv1(y)
+        out2 = self.conv2(y)
+        out3 = self.conv3(y)
+
+        if self.maxpool is not None:
+            out_mp = self.maxpool(x)
+            out_mp = self.conv_maxpool(out_mp)
+
+            # Handle size mismatch by cropping the larger tensor (typically maxpool keeps size, convs may reduce for even kernels)
+            conv_size = out1.size(-1)
+            mp_size = out_mp.size(-1)
+            if mp_size > conv_size:
+                diff = mp_size - conv_size
+                crop_start = diff // 2
+                out_mp = out_mp[:, :, crop_start: crop_start + conv_size]
+            elif conv_size > mp_size:
+                diff = conv_size - mp_size
+                crop_start = diff // 2
+                out1 = out1[:, :, crop_start: crop_start + mp_size]
+                out2 = out2[:, :, crop_start: crop_start + mp_size]
+                out3 = out3[:, :, crop_start: crop_start + mp_size]
+
+            out = torch.cat([out1, out2, out3, out_mp], dim=1)
+        else:
+            out = torch.cat([out1, out2, out3], dim=1)
+
+        out = self.bn(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+
+        # Adjust residual if needed (though padding should minimize)
+        if out.size(-1) != residual.size(-1):
+            diff = abs(out.size(-1) - residual.size(-1))
+            crop_start = diff // 2
+            if out.size(-1) > residual.size(-1):
+                out = out[:, :, crop_start: crop_start + residual.size(-1)]
+            else:
+                residual = residual[:, :, crop_start: crop_start + out.size(-1)]
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+
+class InceptionTime(nn.Module):
+    def __init__(self, input_channels=12, num_classes=9, num_blocks=10, bottleneck_channels=64, out_channels=128,
+                 dropout=0.3):
+        super(InceptionTime, self).__init__()
+        self.init_conv = nn.Conv1d(input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.init_bn = nn.BatchNorm1d(64)
+        self.init_relu = nn.ReLU(inplace=True)
+        self.init_pool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+
+        # Stack more Inception blocks for higher complexity
+        self.layers = nn.ModuleList()
+        current_channels = 64
+        for i in range(num_blocks):
+            block = InceptionBlock(current_channels, bottleneck_channels, out_channels, dropout=dropout)
+            self.layers.append(block)
+            current_channels = out_channels * 4  # Assuming use_maxpool=True, 4 branches
+
+        self.adaptiveavgpool = nn.AdaptiveAvgPool1d(1)
+        self.adaptivemaxpool = nn.AdaptiveMaxPool1d(1)
+        self.fc = nn.Linear(current_channels * 2, num_classes)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.init_conv(x)
+        x = self.init_bn(x)
+        x = self.init_relu(x)
+        x = self.init_pool(x)
+
+        for layer in self.layers:
+            x = layer(x)
+
+        x1 = self.adaptiveavgpool(x)
+        x2 = self.adaptivemaxpool(x)
+        x = torch.cat((x1, x2), dim=1)
+        x = x.view(x.size(0), -1)
+        logits = self.fc(x)
+
+        # 返回一个虚拟的 attention weights（全1张量）
+        dummy_attention = torch.ones(x.size(0), 1).to(x.device)
+        return logits, dummy_attention
+
+
+def inception_time(**kwargs):
+    model = InceptionTime(**kwargs)
+    return model
+
+
+# Example usage (similar to resnet18)
+if __name__ == "__main__":
+    model = inception_time(input_channels=12, num_classes=9)
+    print(model)
+
+    x = torch.randn(4, 12, 5000)  # batch=4, 12 leads, seq_len=5000
+    logits, attn = model(x)
+    print("logits shape:", logits.shape)  # torch.Size([4, 9])
+    print("attention shape:", attn.shape)  # torch.Size([4, 1])
