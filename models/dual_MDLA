@@ -1,0 +1,313 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class DilateAttention(nn.Module):
+    "Implementation of Dilate-attention"
+    def __init__(self, head_dim, qk_scale=None, attn_drop=0, kernel_size=3, dilation=1):
+        super().__init__()
+        self.head_dim = head_dim
+        self.scale = qk_scale or head_dim ** -0.5
+        self.kernel_size = kernel_size
+        self.unfold = nn.Unfold(kernel_size, dilation, dilation * (kernel_size - 1) // 2, 1)
+        self.attn_drop = nn.Dropout(attn_drop)
+
+    def forward(self, q, k, v):
+        B, d, H, W = q.shape
+        q = q.reshape([B, d // self.head_dim, self.head_dim, 1, H * W]).permute(0, 1, 4, 3, 2)  # B,h,N,1,d
+        k = self.unfold(k).reshape(
+            [B, d // self.head_dim, self.head_dim, self.kernel_size * self.kernel_size, H * W]).permute(0, 1, 4, 2, 3)
+        attn = (q @ k) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        v = self.unfold(v).reshape(
+            [B, d // self.head_dim, self.head_dim, self.kernel_size * self.kernel_size, H * W]).permute(0, 1, 4, 3, 2)
+        x = (attn @ v).transpose(1, 2).reshape(B, H, W, d)
+        return x
+
+
+class MultiDilatelocalAttention(nn.Module):
+    "Implementation of Dilate-attention"
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None,
+                 attn_drop=0., proj_drop=0., kernel_size=3, dilation=[2, 3]):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.dilation = dilation
+        self.kernel_size = kernel_size
+        self.scale = qk_scale or head_dim ** -0.5
+        self.num_dilation = len(dilation)
+        assert num_heads % self.num_dilation == 0, f"num_heads {num_heads} must be divisible by num_dilation {self.num_dilation}"
+        self.qkv = nn.Conv2d(dim, dim * 3, 1, bias=qkv_bias)
+        self.dilate_attention = nn.ModuleList(
+            [DilateAttention(head_dim, qk_scale, attn_drop, kernel_size, dilation[i]) for i in range(self.num_dilation)])
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, H, W, C = x.shape
+        x = x.permute(0, 3, 1, 2)  # [B, C, H, W]
+        qkv = self.qkv(x).reshape(B, 3, self.num_dilation, C // self.num_dilation, H, W).permute(2, 1, 0, 3, 4, 5)
+        x_in = x.reshape(B, self.num_dilation, C // self.num_dilation, H, W).permute(1, 0, 3, 4, 2)
+        # Avoid in-place modification
+        x_out = [self.dilate_attention[i](qkv[i][0], qkv[i][1], qkv[i][2]) for i in range(self.num_dilation)]
+        x = torch.stack(x_out, dim=0).permute(1, 2, 3, 0, 4).reshape(B, H, W, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class BasicBlock1d(nn.Module):
+    expansion = 1
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super().__init__()
+        self.conv1 = nn.Conv1d(inplanes, planes, kernel_size=7, stride=stride, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm1d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(p=0.5)
+        self.conv2 = nn.Conv1d(planes, planes, kernel_size=7, stride=1, padding=3, bias=False)
+        self.bn2 = nn.BatchNorm1d(planes)
+        self.downsample = downsample
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        if self.downsample is not None:
+            residual = self.downsample(x)
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+class BasicBlock2d(nn.Module):
+    expansion = 1
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super().__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(p=0.5)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.downsample = downsample
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        if self.downsample is not None:
+            residual = self.downsample(x)
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+class STFTBranch(nn.Module):
+    def __init__(self, input_channels=12, n_fft=32, hop_length=16, inplanes=64, num_classes=9, signal_length=15000):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.inplanes = inplanes
+        self.input_channels = input_channels
+        self.signal_length = signal_length
+
+        # Calculate expected spectrogram dimensions
+        self.freq_dim = n_fft // 2 + 1  # e.g., 49 for n_fft=96
+        self.time_dim = (signal_length - n_fft) // hop_length + 1  # e.g., 468 for signal_length=15000, hop_length=32
+
+        # STFT preprocessing layer
+        self.stft_conv = nn.Conv2d(input_channels, inplanes, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(inplanes)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        # MultiDilatelocalAttention for feature refinement
+        self.attention = MultiDilatelocalAttention(dim=inplanes, num_heads=8, kernel_size=3, dilation=[2, 3])
+
+        # 2D residual network layers
+        self.layer1 = self._make_layer(BasicBlock2d, 64, 2)
+        self.layer2 = self._make_layer(BasicBlock2d, 128, 2, stride=2)
+        self.layer3 = self._make_layer(BasicBlock2d, 256, 2, stride=2)
+        self.layer4 = self._make_layer(BasicBlock2d, 512, 2, stride=2)
+
+        # Adaptive pooling
+        self.adaptiveavgpool = nn.AdaptiveAvgPool2d(1)
+        self.adaptivemaxpool = nn.AdaptiveMaxPool2d(1)
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+        layers = [block(self.inplanes, planes, stride, downsample)]
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        batch_size, channels, length = x.shape
+        # Pad or truncate input to match expected signal length
+        if length != self.signal_length:
+            print(f"Warning: Input signal length {length} does not match expected {self.signal_length}. Normalizing to {self.signal_length}.")
+            if length < self.signal_length:
+                x = F.pad(x, (0, self.signal_length - length))
+            else:
+                x = x[:, :, :self.signal_length]
+            length = self.signal_length
+
+        stft_features = []
+        # Generate STFT spectrograms
+        for i in range(channels):
+            channel_data = x[:, i, :]
+            stft = torch.stft(
+                channel_data,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                window=torch.hann_window(self.n_fft).to(x.device),
+                return_complex=True,
+                pad_mode='reflect'
+            )
+            magnitude = torch.abs(stft).unsqueeze(1)  # [B, 1, freq, time]
+            stft_features.append(magnitude)
+
+        x = torch.cat(stft_features, dim=1)  # [B, input_channels, freq, time]
+        x = self.stft_conv(x)  # [B, inplanes, freq//2, time//2]
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)  # [B, inplanes, freq//4, time//4]
+
+        # Apply MultiDilatelocalAttention
+        B, C, H, W = x.shape
+        x = x.permute(0, 2, 3, 1)  # [B, H, W, C]
+        x = self.attention(x)  # [B, H, W, C]
+        x = x.permute(0, 3, 1, 2)  # [B, C, H, W]
+
+        # Residual layers
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        # Dual pooling
+        x1 = self.adaptiveavgpool(x)
+        x2 = self.adaptivemaxpool(x)
+        x = torch.cat((x1, x2), dim=1)
+        x = x.view(x.size(0), -1)
+        return x
+
+
+class DualBranchResNet(nn.Module):
+    def __init__(self, block=BasicBlock1d, layers=[2, 2, 2, 2], input_channels=12, inplanes=64, num_classes=9, signal_length=15000):
+        super().__init__()
+        self.inplanes = inplanes
+        self.conv1 = nn.Conv1d(input_channels, inplanes, kernel_size=15, stride=2, padding=7, bias=False)
+        self.bn1 = nn.BatchNorm1d(inplanes)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+        self.adaptiveavgpool = nn.AdaptiveAvgPool1d(1)
+        self.adaptivemaxpool = nn.AdaptiveMaxPool1d(1)
+
+        # STFT branch with MultiDilatelocalAttention
+        self.stft_branch = STFTBranch(
+            input_channels=input_channels,
+            n_fft=96,
+            hop_length=32,
+            inplanes=inplanes,
+            signal_length=signal_length
+        )
+
+        # Attention mechanism
+        self.attention = nn.Sequential(
+            nn.Linear(512 * block.expansion * 2 + 1024, 256),
+            nn.ReLU(),
+            nn.Linear(256, 512 * block.expansion * 2 + 1024),
+            nn.Sigmoid()
+        )
+
+        # Fusion and classifier
+        self.fc = nn.Linear(512 * block.expansion * 2 + 1024, num_classes)
+        self.dropout = nn.Dropout(0.5)
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv1d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm1d(planes * block.expansion),
+            )
+        layers = [block(self.inplanes, planes, stride, downsample)]
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        # 1D branch
+        x1d = self.conv1(x)
+        x1d = self.bn1(x1d)
+        x1d = self.relu(x1d)
+        x1d = self.maxpool(x1d)
+        x1d = self.layer1(x1d)
+        x1d = self.layer2(x1d)
+        x1d = self.layer3(x1d)
+        x1d = self.layer4(x1d)
+        x1d_avg = self.adaptiveavgpool(x1d)
+        x1d_max = self.adaptivemaxpool(x1d)
+        x1d = torch.cat((x1d_avg, x1d_max), dim=1)
+        x1d = x1d.view(x1d.size(0), -1)
+
+        # STFT branch
+        x2d = self.stft_branch(x)
+
+        # Fuse features
+        combined = torch.cat((x1d, x2d), dim=1)
+        attention_weights = self.attention(combined)
+        attended = combined * attention_weights
+        attended = self.dropout(attended)
+        logits = self.fc(attended)
+        return logits, attention_weights
+
+
+def resnet18_dual(**kwargs):
+    return DualBranchResNet(BasicBlock1d, [2, 2, 2, 2], **kwargs)
+
+
+def resnet34_dual(**kwargs):
+    return DualBranchResNet(BasicBlock1d, [3, 4, 6, 3], **kwargs)
+
+
+if __name__ == "__main__":
+    # Enable anomaly detection for debugging (uncomment if needed)
+    # torch.autograd.set_detect_anomaly(True)
+
+    # Test MultiDilatelocalAttention
+    x = torch.rand([3, 64, 64, 64])
+    m = MultiDilatelocalAttention(64)
+    y = m(x)
+    print(f"MultiDilatelocalAttention output shape: {y.shape}")
+
+    # Test DualBranchResNet with STFTBranch
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = resnet18_dual(input_channels=12, num_classes=9, signal_length=15000).to(device)
+    x = torch.rand([3, 12, 15000]).to(device)
+    logits, attention_weights = model(x)
+    print(f"DualBranchResNet logits shape: {logits.shape}")
+    print(f"DualBranchResNet attention_weights shape: {attention_weights.shape}")
