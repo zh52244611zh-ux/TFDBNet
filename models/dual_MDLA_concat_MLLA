@@ -1,0 +1,380 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+
+# ==================== MLLA 模块（完整保留）===================
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class DropPath(nn.Module):
+    def __init__(self, drop_prob=0.):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if self.drop_prob == 0. or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x.div(keep_prob) * random_tensor
+
+
+class RoPE1D(nn.Module):
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        self.dim = dim
+        self.base = base
+
+    def forward(self, x):
+        B, L, D = x.shape
+        position = torch.arange(L, dtype=torch.float32, device=x.device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.dim, 2, dtype=torch.float32, device=x.device) *
+                             (-math.log(self.base) / self.dim))
+        pe = torch.zeros(L, self.dim, device=x.device)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return x + pe.unsqueeze(0)
+
+
+class LinearAttention1D(nn.Module):
+    def __init__(self, dim, num_heads, qkv_bias=True):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        assert self.head_dim * num_heads == dim
+
+        self.qk = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.elu = nn.ELU()
+        self.lepe = nn.Conv1d(dim, dim, 3, padding=1, groups=dim)
+        self.rope = RoPE1D(dim=dim)
+
+    def forward(self, x):
+        B, L, C = x.shape
+        qk = self.qk(x).reshape(B, L, 2, C).permute(2, 0, 1, 3)
+        q, k = qk[0], qk[1]
+        q = self.elu(q) + 1.0
+        k = self.elu(k) + 1.0
+
+        q_rope = self.rope(q)
+        k_rope = self.rope(k)
+
+        q_rope = q_rope.reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k_rope = k_rope.reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = x.reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        z = 1 / (torch.einsum('bhid,bhjd->bhij', q_rope, k_rope.mean(dim=2, keepdim=True)) + 1e-6)
+        kv = torch.einsum('bhjd,bhje->bhde', k_rope * (L ** -0.5), v * (L ** -0.5))
+        x_out = torch.einsum('bhid,bhde->bhie', q_rope, kv) * z
+        x_out = x_out.transpose(1, 2).reshape(B, L, C)
+
+        v_reshaped = v.transpose(1, 2).reshape(B, L, C).permute(0, 2, 1)
+        x_out = x_out + self.lepe(v_reshaped).permute(0, 2, 1)
+        return x_out
+
+
+class MLLABlock1D(nn.Module):
+    def __init__(self, dim, num_heads=8, mlp_ratio=4., drop=0.1, drop_path=0.):
+        super().__init__()
+        self.cpe1 = nn.Conv1d(dim, dim, 3, padding=1, groups=dim)
+        self.norm1 = nn.LayerNorm(dim)
+        self.in_proj = nn.Linear(dim, dim)
+        self.act_proj = nn.Linear(dim, dim)
+        self.dwc = nn.Conv1d(dim, dim, 3, padding=1, groups=dim)
+        self.act = nn.SiLU()
+        self.attn = LinearAttention1D(dim=dim, num_heads=num_heads)
+        self.out_proj = nn.Linear(dim, dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.cpe2 = nn.Conv1d(dim, dim, 3, padding=1, groups=dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), drop=drop)
+
+    def forward(self, x):
+        x = x + self.cpe1(x.permute(0, 2, 1)).permute(0, 2, 1)
+        shortcut = x
+        x = self.norm1(x)
+        act_res = self.act(self.act_proj(x))
+        x_proj = self.act(self.dwc(self.in_proj(x).permute(0, 2, 1))).permute(0, 2, 1)
+        x_attn = self.attn(x_proj)
+        x = shortcut + self.drop_path(self.out_proj(x_attn * act_res))
+        x = x + self.cpe2(x.permute(0, 2, 1)).permute(0, 2, 1)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+
+# ==================== MultiDilateLocalAttention（完整保留）===================
+class DilateAttention(nn.Module):
+    def __init__(self, head_dim, kernel_size=3, dilation=1):
+        super().__init__()
+        self.head_dim = head_dim
+        self.scale = head_dim ** -0.5
+        self.kernel_size = kernel_size
+        self.dilation = dilation
+        padding = dilation * (kernel_size - 1) // 2
+        self.unfold = nn.Unfold(kernel_size=kernel_size, dilation=dilation, padding=padding, stride=1)
+
+    def forward(self, q, k, v):
+        B, C, H, W = q.shape
+        q = q.reshape(B, -1, self.head_dim, 1, H * W).permute(0, 1, 4, 3, 2)
+        k = self.unfold(k).reshape(B, -1, self.head_dim, self.kernel_size**2, H*W).permute(0, 1, 4, 2, 3)
+        v = self.unfold(v).reshape(B, -1, self.head_dim, self.kernel_size**2, H*W).permute(0, 1, 4, 3, 2)
+
+        attn = (q @ k) * self.scale
+        attn = attn.softmax(dim=-1)
+        x = (attn @ v).transpose(1, 2).reshape(B, C, H, W)
+        return x
+
+
+class MultiDilatelocalAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, kernel_size=3, dilation=[2, 3]):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.num_dilation = len(dilation)
+        assert num_heads % self.num_dilation == 0
+        self.head_dim = dim // num_heads
+
+        self.qkv = nn.Conv2d(dim, dim * 3, 1, bias=False)
+        self.dilate_attn = nn.ModuleList([
+            DilateAttention(self.head_dim * (dim // self.num_dilation // self.head_dim), kernel_size, d)
+            for d in dilation
+        ])
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(0.1)
+
+    def forward(self, x):
+        B, H, W, C = x.shape
+        x = x.permute(0, 3, 1, 2)
+        qkv = self.qkv(x).reshape(B, 3, self.num_dilation, -1, H, W).permute(2, 1, 0, 3, 4, 5)
+        outs = []
+        for i in range(self.num_dilation):
+            out = self.dilate_attn[i](qkv[i][0], qkv[i][1], qkv[i][2])
+            outs.append(out)
+        x = torch.cat(outs, dim=1)
+        x = x.permute(0, 2, 3, 1)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+# ==================== 1D & 2D BasicBlock ====================
+class BasicBlock1d(nn.Module):
+    expansion = 1
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super().__init__()
+        self.conv1 = nn.Conv1d(inplanes, planes, 7, stride=stride, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm1d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv1d(planes, planes, 7, padding=3, bias=False)
+        self.bn2 = nn.BatchNorm1d(planes)
+        self.downsample = downsample
+
+    def forward(self, x):
+        identity = x if self.downsample is None else self.downsample(x)
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += identity
+        out = self.relu(out)
+        return out
+
+
+class BasicBlock2d(nn.Module):
+    expansion = 1
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super().__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, 3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(planes, planes, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.downsample = downsample
+
+    def forward(self, x):
+        identity = x if self.downsample is None else self.downsample(x)
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += identity
+        out = self.relu(out)
+        return out
+
+
+# ==================== STFT 分支 ====================
+class STFTBranch(nn.Module):
+    def __init__(self, input_channels=12, n_fft=96, hop_length=32, signal_length=15000):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.signal_length = signal_length
+        self.inplanes = 64  # 必须初始化！
+
+        # 初始卷积
+        self.conv = nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        # 注意力
+        self.attention = MultiDilatelocalAttention(dim=64, num_heads=8)
+
+        # ResNet 层（正确写法）
+        self.layer1 = self._make_layer(BasicBlock2d, 64,  2)                    # 64  → 64
+        self.layer2 = self._make_layer(BasicBlock2d, 128, 2, stride=2)         # 64  → 128
+        self.layer3 = self._make_layer(BasicBlock2d, 256, 2, stride=2)         # 128 → 256
+        self.layer4 = self._make_layer(BasicBlock2d, 512, 2, stride=2)         # 256 → 512
+
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.maxpool = nn.AdaptiveMaxPool2d(1)
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample))
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        B, C, L = x.shape
+        if L != self.signal_length:
+            if L < self.signal_length:
+                x = F.pad(x, (0, self.signal_length - L))
+            else:
+                x = x[:, :, :self.signal_length]
+
+        # 向量化 STFT（最快）
+        window = torch.hann_window(self.n_fft, device=x.device)
+        spec = torch.stft(x.flatten(0, 1), n_fft=self.n_fft, hop_length=self.hop_length,
+                          window=window, return_complex=True, pad_mode='reflect')
+        mag = torch.abs(spec).view(B, C, spec.shape[-2], spec.shape[-1])
+
+        x = self.conv(mag)
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.maxpool(x)                                 # [B, 64, H, W]
+
+        # 注意力
+        B, C, H, W = x.shape
+        x = x.permute(0, 2, 3, 1)                            # [B, H, W, 64]
+        x = self.attention(x)
+        x = x.permute(0, 3, 1, 2)                            # [B, 64, H, W]
+
+        # ResNet 主干
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)                                  # [B, 512, h, w]
+
+        # 双池化
+        avg = self.avgpool(x)
+        max_ = self.maxpool(x)
+        out = torch.cat([avg, max_], dim=1).flatten(1)       # [B, 1024]
+        return out
+
+
+# ==================== 主模型：直接 Concat 融合（无 HiLo）===================
+class DualBranchResNet(nn.Module):
+    def __init__(self, input_channels=12, signal_length=15000, num_classes=9, use_mlla=True):
+        super().__init__()
+        self.signal_length = signal_length
+        self.inplanes = 64
+
+        # 1D 分支
+        self.conv1 = nn.Conv1d(input_channels, 64, 15, stride=2, padding=7, bias=False)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool1d(3, stride=2, padding=1)
+
+        self.layer1 = self._make_layer(BasicBlock1d, 64, 2)
+        self.layer2 = self._make_layer(BasicBlock1d, 128, 2, stride=2)
+        self.layer3 = self._make_layer(BasicBlock1d, 256, 2, stride=2)
+        self.layer4 = self._make_layer(BasicBlock1d, 512, 2, stride=2)
+
+        self.mlla = MLLABlock1D(dim=512, num_heads=8, mlp_ratio=2.0) if use_mlla else None
+
+        self.avgpool1d = nn.AdaptiveAvgPool1d(1)
+        self.maxpool1d = nn.AdaptiveMaxPool1d(1)
+
+        # STFT 分支
+        self.stft_branch = STFTBranch(input_channels=input_channels, signal_length=signal_length)
+
+        # 分类头：直接 concat
+        self.fc = nn.Linear(1024 + 1024, num_classes)
+        self.dropout = nn.Dropout(0.5)
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None if stride == 1 and self.inplanes == planes else \
+            nn.Sequential(nn.Conv1d(self.inplanes, planes, 1, stride=stride, bias=False),
+                          nn.BatchNorm1d(planes))
+        layers = [block(self.inplanes, planes, stride, downsample)]
+        self.inplanes = planes
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        # 1D 分支
+        x1d = self.conv1(x)
+        x1d = self.bn1(x1d)
+        x1d = self.relu(x1d)
+        x1d = self.maxpool(x1d)
+        x1d = self.layer1(x1d)
+        x1d = self.layer2(x1d)
+        x1d = self.layer3(x1d)
+        x1d = self.layer4(x1d)
+
+        if self.mlla is not None:
+            x1d = x1d.permute(0, 2, 1)
+            x1d = self.mlla(x1d)
+            x1d = x1d.permute(0, 2, 1)
+
+        f1 = torch.cat([self.avgpool1d(x1d), self.maxpool1d(x1d)], dim=1).flatten(1)  # [B, 1024]
+
+        # STFT 分支
+        f2 = self.stft_branch(x)  # [B, 1024]
+
+        # 直接 Concat 融合
+        fused = torch.cat([f1, f2], dim=1)  # [B, 2048]
+        fused = self.dropout(fused)
+        logits = self.fc(fused)
+        return logits, None
+
+
+# ==================== 快捷函数 ====================
+def dualbranch_concat(**kwargs):
+    return DualBranchResNet(**kwargs)
+
+def dualbranch_concat_no_mlla(**kwargs):
+    return DualBranchResNet(use_mlla=False, **kwargs)
